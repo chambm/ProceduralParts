@@ -703,7 +703,7 @@ namespace ProceduralParts
 
             if (density + 0.0001 < minDensity)
             {
-                validationError = $"density needs to be {minDensity:0.###} or higher";
+                validationError = $"Stringer Mass needs to be {minDensity:0.###} or higher";
                 return false;
             }
 

@@ -701,7 +701,8 @@ namespace ProceduralParts
             costToResolve = 0;
             techToResolve = null;
 
-            if (density + 0.0001 < minDensity)
+            if (minDensity > 0f && maxDensity > 0f &&
+                density + 0.0001 < minDensity)
             {
                 validationError = $"Stringer Mass needs to be {minDensity:0.###} or higher";
                 return false;

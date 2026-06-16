@@ -32,6 +32,11 @@ namespace ProceduralParts
         public SpineNode(float pos, float h, float v) { position = pos; sizeH = h; sizeV = v; }
         public void Load(ConfigNode node) => ConfigNode.LoadObjectFromConfig(this, node);
         public void Save(ConfigNode node) => ConfigNode.CreateConfigFromObject(this, node);
+        public SpineNode Clone() => new SpineNode
+        {
+            position = position, sizeH = sizeH, sizeV = sizeV,
+            profile = profile, mode = mode, slopeAbove = slopeAbove,
+        };
     }
 
     class ProceduralShapeSpine : ProceduralAbstractShape
@@ -61,6 +66,70 @@ namespace ProceduralParts
 
         // Spine cross-sections, sorted by position. Serialized as SPINE_NODE subnodes.
         public readonly List<SpineNode> nodes = new List<SpineNode>();
+
+        // --- Per-node editing proxies (PAW) ---
+        // KSPFields are scalars, so these proxy whichever node `selectedNode` points at: changing one
+        // writes back to that SpineNode. Non-persistent (the node list is the source of truth) except
+        // selectedNode. Symmetry is handled manually (SyncToSymmetry), so they don't auto-propagate.
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Node", guiFormat = "F0", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatRange(minValue = 0, maxValue = 2, stepIncrement = 1, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public float selectedNode = 0;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node mode", groupName = ProceduralPart.PAWGroupName),
+            UI_ChooseOption(scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public string nodeModeOpt = "Proportional";
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node size", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, incrementSlide = SliderPrecision, sigFigs = 4, unit = "m", useSI = true, affectSymCounterparts = UI_Scene.None)]
+        public float nodeSize = 1.25f;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node position", guiFormat = "F3", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0f, maxValue = 1f, incrementSlide = SliderPrecision, sigFigs = 3, affectSymCounterparts = UI_Scene.None)]
+        public float nodePos = 0.5f;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Slope above", groupName = ProceduralPart.PAWGroupName),
+            UI_ChooseOption(scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public string nodeSlopeOpt = "Linear";
+
+        [KSPEvent(guiActiveEditor = true, guiName = "Add node", groupName = ProceduralPart.PAWGroupName)]
+        public void AddNodeEvent()
+        {
+            int i = SelIndex;
+            SpineNode a = nodes[i];
+            SpineNode b = nodes[Mathf.Min(i + 1, nodes.Count - 1)];
+            float pos = (i < nodes.Count - 1) ? 0.5f * (a.position + b.position) : Mathf.Clamp01(a.position - 0.1f);
+            var mid = new SpineNode
+            {
+                position = pos,
+                sizeH = 0.5f * (a.sizeH + b.sizeH),
+                sizeV = 0.5f * (a.sizeV + b.sizeV),
+            };
+            nodes.Add(mid);
+            SortNodes();
+            selectedNode = nodes.IndexOf(mid);
+            RefreshSelector();
+            LoadProxyFromNode();
+            RebuildAndPropagate();
+            MonoUtilities.RefreshPartContextWindow(part);
+        }
+
+        [KSPEvent(guiActiveEditor = true, guiName = "Remove node", groupName = ProceduralPart.PAWGroupName)]
+        public void RemoveNodeEvent()
+        {
+            if (nodes.Count <= 2)
+            {
+                ScreenMessages.PostScreenMessage("Spine needs at least 2 nodes.", 4f, ScreenMessageStyle.UPPER_CENTER);
+                return;
+            }
+            nodes.RemoveAt(SelIndex);
+            selectedNode = Mathf.Clamp((int)selectedNode, 0, nodes.Count - 1);
+            RefreshSelector();
+            LoadProxyFromNode();
+            RebuildAndPropagate();
+            MonoUtilities.RefreshPartContextWindow(part);
+        }
+
+        private int SelIndex => Mathf.Clamp((int)selectedNode, 0, Mathf.Max(0, nodes.Count - 1));
 
         #endregion
 
@@ -128,6 +197,19 @@ namespace ProceduralParts
                 Fields[nameof(length)].uiControlEditor.onFieldChanged = OnShapeDimensionChanged;
                 Fields[nameof(hScale)].uiControlEditor.onFieldChanged = OnShapeDimensionChanged;
                 Fields[nameof(vScale)].uiControlEditor.onFieldChanged = OnShapeDimensionChanged;
+
+                Fields[nameof(selectedNode)].uiControlEditor.onFieldChanged = OnSelectedNodeChanged;
+                UI_ChooseOption modeOpt = Fields[nameof(nodeModeOpt)].uiControlEditor as UI_ChooseOption;
+                modeOpt.options = Enum.GetNames(typeof(SpineNodeMode));
+                modeOpt.onFieldChanged = OnNodeFieldChanged;
+                UI_ChooseOption slopeOpt = Fields[nameof(nodeSlopeOpt)].uiControlEditor as UI_ChooseOption;
+                slopeOpt.options = Enum.GetNames(typeof(SpineSlope));
+                slopeOpt.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeSize)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodePos)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+
+                RefreshSelector();
+                LoadProxyFromNode();
             }
         }
 
@@ -144,19 +226,36 @@ namespace ProceduralParts
             hEdit.incrementLarge = vEdit.incrementLarge = 0.25f;
             hEdit.incrementSmall = vEdit.incrementSmall = 0.05f;
 
+            UI_FloatEdit sizeEdit = Fields[nameof(nodeSize)].uiControlEditor as UI_FloatEdit;
+            sizeEdit.minValue = MinSize;
+            sizeEdit.maxValue = MaxSize;
+            sizeEdit.incrementLarge = PPart.diameterLargeStep;
+            sizeEdit.incrementSmall = PPart.diameterSmallStep;
+
+            ClampNodeSizes();   // heal any out-of-range sizes from older builds/crafts
             AdjustDimensionBounds();
             length = Mathf.Clamp(length, lengthEdit.minValue, lengthEdit.maxValue);
             hScale = Mathf.Clamp(hScale, hEdit.minValue, hEdit.maxValue);
             vScale = Mathf.Clamp(vScale, vEdit.minValue, vEdit.maxValue);
+            LoadProxyFromNode();
         }
 
         #endregion
 
         #region Update
 
+        // Set while a rebuild is in flight. The Volume setter fires onEditorShipModified, which can
+        // synchronously rebuild the PAW and re-fire our proxy field handlers -> guard against that
+        // re-entering and recursively mangling the node sizes (it was a stack overflow / crash).
+        private bool _rebuilding;
+
         internal override void UpdateShape(bool force = true)
         {
             Profiler.BeginSample("UpdateShape Spine");
+            bool prevRebuilding = _rebuilding;
+            _rebuilding = true;
+            try
+            {
             EnsureNodes();
             SortNodes();
             part.CoMOffset = CoMOffset;
@@ -172,8 +271,6 @@ namespace ProceduralParts
             MinDiameter = minDia;
             InnerMaxDiameter = InnerMinDiameter = -1f;
             Length = length;
-            NominalVolume = CalculateVolume(rings);
-            Volume = NominalVolume;
 
             GenerateSideMesh(rings);
             GenerateCapMesh(rings);
@@ -181,25 +278,92 @@ namespace ProceduralParts
 
             UpdateNodeSize(BottomNodeName, EndDiameter(0));
             UpdateNodeSize(TopNodeName, EndDiameter(rings.Count - 1));
+
+            // Set volume last (the setter fires OnPartVolumeChanged / onEditorShipModified) so the
+            // visible mesh is already updated even if a volume listener throws.
+            NominalVolume = CalculateVolume(rings);
+            Volume = NominalVolume;
+
             PPart.UpdateProps();
             RaiseModelAndColliderChanged();
-            Profiler.EndSample();
+            }
+            finally
+            {
+                _rebuilding = prevRebuilding;
+                Profiler.EndSample();
+            }
         }
 
         private struct Ring { public float y, rH, rV; }
 
+        // Sane size bounds. A node "size" is a cross-section diameter. The hard 100 m cap on the
+        // effective (scaled) radius keeps the volume well within the SI formatter's range -- an
+        // absurd value made TankContentSwitcher throw "Illegal prefix".
+        private float MaxSize => (PPart.diameterMax == float.PositiveInfinity) ? 50f : Mathf.Min(PPart.diameterMax, 50f);
+        private float MinSize => Mathf.Max(0.1f, PPart.diameterMin);
+
+        // Heal any out-of-range node sizes (e.g. a part bloated by an earlier bug) back into bounds.
+        private void ClampNodeSizes()
+        {
+            foreach (SpineNode n in nodes)
+            {
+                n.sizeH = Mathf.Clamp(n.sizeH, MinSize, MaxSize);
+                n.sizeV = Mathf.Clamp(n.sizeV, MinSize, MaxSize);
+            }
+        }
+
+        private Ring NodeRing(SpineNode n) => new Ring
+        {
+            y = (n.position - 0.5f) * length,
+            // Clamp to a finite positive radius so the volume can never go to 0/NaN/Infinity (which
+            // the volume listeners reject) or so large the SI formatter overflows.
+            rH = 0.5f * Mathf.Clamp(n.sizeH * hScale, 0.05f, 100f),
+            rV = 0.5f * Mathf.Clamp(n.sizeV * vScale, 0.05f, 100f),
+        };
+
+        // Build the loft rings, subdividing each segment per its lower node's slopeAbove so the
+        // silhouette curves (concave/convex/waisted). Linear segments need no extra rings.
         private List<Ring> BuildRings()
         {
-            var rings = new List<Ring>(nodes.Count);
-            foreach (SpineNode n in nodes)
-                rings.Add(new Ring
+            EnsureNodes();
+            SortNodes();
+            var rings = new List<Ring> { NodeRing(nodes[0]) };
+            for (int i = 1; i < nodes.Count; i++)
+            {
+                Ring a = NodeRing(nodes[i - 1]);
+                Ring b = NodeRing(nodes[i]);
+                SpineSlope slope = nodes[i - 1].slopeAbove;
+                int k = (slope == SpineSlope.Linear) ? 1 : 10;
+                for (int s = 1; s <= k; s++)
                 {
-                    y = (n.position - 0.5f) * length,
-                    rH = 0.5f * n.sizeH * hScale,
-                    rV = 0.5f * n.sizeV * vScale,
-                });
+                    float t = (float)s / k;
+                    float h = SlopeBlend(slope, t);
+                    float w = WaistFactor(slope, t);
+                    rings.Add(new Ring
+                    {
+                        y = Mathf.Lerp(a.y, b.y, t),
+                        rH = Mathf.Lerp(a.rH, b.rH, h) * w,
+                        rV = Mathf.Lerp(a.rV, b.rV, h) * w,
+                    });
+                }
+            }
             return rings;
         }
+
+        // Radius blend across a segment, t in [0,1]. Maps the straight 0..1 chord into a curve.
+        private static float SlopeBlend(SpineSlope slope, float t)
+        {
+            switch (slope)
+            {
+                case SpineSlope.Concave: return t * t;            // caves inward (below the chord)
+                case SpineSlope.Convex: return t * (2f - t);      // bulges outward (above the chord)
+                default: return t;                                 // Linear / Waisted use the chord
+            }
+        }
+
+        // Multiplicative pinch for the waisted profile (narrow in the middle), 1 otherwise.
+        private static float WaistFactor(SpineSlope slope, float t) =>
+            slope == SpineSlope.Waisted ? 1f - 0.35f * Mathf.Sin(Mathf.PI * t) : 1f;
 
         // Bounding diameter of an end ring (used for stack node sizing).
         private float EndDiameter(int ringIndex)
@@ -276,6 +440,213 @@ namespace ProceduralParts
             coords.r *= Mathf.Max(0.01f, MaxDiameter / 2);
             coords.y *= Mathf.Max(0.01f, length);
         }
+
+        #endregion
+
+        #region Node editing
+
+        private void RefreshSelector()
+        {
+            if (Fields[nameof(selectedNode)].uiControlEditor is UI_FloatRange fr)
+                fr.maxValue = Mathf.Max(0, nodes.Count - 1);
+            selectedNode = SelIndex;
+        }
+
+        // Pull the selected node's data into the PAW proxy fields.
+        private void LoadProxyFromNode()
+        {
+            if (nodes.Count == 0) return;
+            SpineNode n = nodes[SelIndex];
+            nodeModeOpt = n.mode.ToString();
+            nodeSlopeOpt = n.slopeAbove.ToString();
+            nodePos = n.position;
+            nodeSize = SizeForMode(n);
+        }
+
+        private static float SizeForMode(SpineNode n)
+        {
+            switch (n.mode)
+            {
+                case SpineNodeMode.Vertical: return n.sizeV;
+                case SpineNodeMode.Horizontal: return n.sizeH;
+                default: return Mathf.Max(n.sizeH, n.sizeV);
+            }
+        }
+
+        private void OnSelectedNodeChanged(BaseField f, object obj)
+        {
+            // Ignore re-fires triggered by our own rebuild, and no-op re-fires from PAW construction.
+            if (_rebuilding) return;
+            if (Equals(f.GetValue(this), obj)) return;
+            LoadProxyFromNode();
+            MonoUtilities.RefreshPartContextWindow(part);
+        }
+
+        // A proxy field (mode/size/position/slope) changed -> write back to the selected node.
+        private void OnNodeFieldChanged(BaseField f, object obj)
+        {
+            // Ignore re-fires triggered by our own rebuild (the Volume setter can synchronously
+            // rebuild the PAW), and the no-op re-fires PAW construction issues.
+            if (_rebuilding) return;
+            if (Equals(f.GetValue(this), obj)) return;
+            if (nodes.Count == 0) return;
+            SpineNode n = nodes[SelIndex];
+            Debug.Log($"{ModTag} OnNodeFieldChanged {f.name}: {obj} -> {f.GetValue(this)} | sel={SelIndex}/{nodes.Count} before: {Dump(n)}");
+            try
+            {
+                n.mode = ParseEnum(nodeModeOpt, SpineNodeMode.Proportional);
+                n.slopeAbove = ParseEnum(nodeSlopeOpt, SpineSlope.Linear);
+
+                // Position is clamped strictly between the neighbours so a node can't cross another.
+                int idx = SelIndex;
+                float loPos = (idx > 0) ? nodes[idx - 1].position + 0.01f : 0f;
+                float hiPos = (idx < nodes.Count - 1) ? nodes[idx + 1].position - 0.01f : 1f;
+                if (loPos > hiPos) loPos = hiPos = 0.5f * (loPos + hiPos);
+                n.position = Mathf.Clamp(nodePos, loPos, hiPos);
+                nodePos = n.position;   // reflect the clamp in the slider
+
+                if (f.name == nameof(nodeSize))
+                {
+                    float size = Mathf.Clamp(nodeSize, MinSize, MaxSize);
+                    switch (n.mode)
+                    {
+                        case SpineNodeMode.Vertical: n.sizeV = size; break;
+                        case SpineNodeMode.Horizontal: n.sizeH = size; break;
+                        default:
+                            // Proportional: drive max(sizeH,sizeV) to `size`, preserving aspect ratio.
+                            // Computed from the CURRENT sizes (not the event's old value) so a repeated
+                            // fire is idempotent (ratio -> 1) and can never compound.
+                            float curMax = Mathf.Max(n.sizeH, n.sizeV);
+                            float ratio = (curMax > 0f) ? size / curMax : 1f;
+                            n.sizeH *= ratio;
+                            n.sizeV *= ratio;
+                            break;
+                    }
+                    n.sizeH = Mathf.Clamp(n.sizeH, MinSize, MaxSize);
+                    n.sizeV = Mathf.Clamp(n.sizeV, MinSize, MaxSize);
+                }
+                else if (f.name == nameof(nodeModeOpt))
+                {
+                    // Switching mode just changes what the Size slider means; refresh its display.
+                    nodeSize = SizeForMode(n);
+                    MonoUtilities.RefreshPartContextWindow(part);
+                }
+
+                // Position edits can reorder; keep the selection on the same node.
+                SortNodes();
+                selectedNode = Mathf.Clamp(nodes.IndexOf(n), 0, nodes.Count - 1);
+                RebuildAndPropagate();
+                Debug.Log($"{ModTag}  applied -> sel={SelIndex} after: {Dump(n)}");
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"{ModTag} OnNodeFieldChanged({f.name}) FAILED: {e}\n  nodes: {DumpAll()}");
+            }
+        }
+
+        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} mode={n.mode} slope={n.slopeAbove}]";
+        private string DumpAll() => string.Join(" ", nodes.ConvertAll(Dump).ToArray()) + $" | len={length:F3} hS={hScale:F3} vS={vScale:F3}";
+
+        private static T ParseEnum<T>(string s, T fallback) where T : struct =>
+            Enum.TryParse(s, out T v) ? v : fallback;
+
+        private void RebuildAndPropagate()
+        {
+            UpdateShape();          // sets Volume -> fires OnPartVolumeChanged + onEditorShipModified
+            UpdateInterops();       // FAR / TestFlight
+            SyncToSymmetry();
+        }
+
+        // The node list isn't a scalar KSPField, so symmetry isn't auto-mirrored. Copy our state to
+        // each counterpart's spine module and rebuild it.
+        private void SyncToSymmetry()
+        {
+            foreach (Part p in part.symmetryCounterparts)
+            {
+                if (FindAbstractShapeModule(p, this) is ProceduralShapeSpine pm)
+                {
+                    pm.length = length;
+                    pm.hScale = hScale;
+                    pm.vScale = vScale;
+                    pm.selectedNode = selectedNode;
+                    pm.nodes.Clear();
+                    foreach (SpineNode n in nodes) pm.nodes.Add(n.Clone());
+                    pm.UpdateShape();
+                    pm.UpdateInterops();
+                    pm.LoadProxyFromNode();
+                }
+            }
+        }
+
+        #endregion
+
+        #region Editor gizmo (visualization)
+
+        // One handle sphere per node, on the node's top surface. Highlights the selected node so you
+        // can see which node the PAW controls are editing. Visualization only for now -- dragging /
+        // wheel / middle-click come in the interactive pass. Update() only runs while this shape is
+        // the active (enabled) one; OnDisable cleans up when you switch shapes.
+        private readonly List<GameObject> _handles = new List<GameObject>();
+
+        public void Update()
+        {
+            if (!HighLogic.LoadedSceneIsEditor || nodes.Count == 0) { DestroyHandles(); return; }
+            while (_handles.Count < nodes.Count) _handles.Add(CreateHandle());
+            while (_handles.Count > nodes.Count)
+            {
+                GameObject extra = _handles[_handles.Count - 1];
+                _handles.RemoveAt(_handles.Count - 1);
+                if (extra != null) Destroy(extra);
+            }
+            int sel = SelIndex;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                SpineNode n = nodes[i];
+                float y = (n.position - 0.5f) * length;
+                GameObject h = _handles[i];
+                if (h == null) { _handles[i] = h = CreateHandle(); }
+                h.transform.SetParent(part.transform, false);
+                h.transform.localPosition = new Vector3(0f, y, 0f);   // on the spine axis
+                h.transform.localRotation = Quaternion.identity;
+                h.transform.localScale = Vector3.one * (i == sel ? 0.22f : 0.15f);
+                h.layer = part.gameObject.layer;
+                if (h.GetComponent<Renderer>() is Renderer r)
+                    r.sharedMaterial = HandleMat(i == sel);   // ZTest Always -> visible through the hull
+            }
+        }
+
+        private GameObject CreateHandle()
+        {
+            GameObject go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            go.name = "SpineNodeHandle";
+            if (go.GetComponent<Collider>() is Collider c) Destroy(c);
+            return go;
+        }
+
+        private static Material _matSel, _matNorm;
+        private static Material HandleMat(bool selected) =>
+            selected ? (_matSel ??= MakeMat(Color.yellow)) : (_matNorm ??= MakeMat(new Color(0.2f, 0.8f, 1f)));
+
+        // Unlit, solid, always-on-top material (renders through the mesh).
+        private static Material MakeMat(Color col)
+        {
+            Material m = new Material(Shader.Find("Hidden/Internal-Colored")) { hideFlags = HideFlags.HideAndDontSave };
+            m.SetColor("_Color", col);
+            m.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.Always);
+            m.SetInt("_ZWrite", 0);
+            m.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+            m.renderQueue = 5000;
+            return m;
+        }
+
+        private void DestroyHandles()
+        {
+            foreach (GameObject h in _handles) if (h != null) Destroy(h);
+            _handles.Clear();
+        }
+
+        public void OnDisable() => DestroyHandles();
+        public void OnDestroy() => DestroyHandles();
 
         #endregion
 

@@ -7,11 +7,9 @@ using UnityEngine.Profiling;
 
 namespace ProceduralParts
 {
-    // Cross-section outline family. Phase 1 implements Ellipse/Circle; Mk2/Mk3 land in Phase 2.
-    public enum SpineProfile { Ellipse, Circle, Mk2, Mk3 }
-
-    // Which size a single (gizmo / Size-slider) adjustment changes for a node.
-    public enum SpineNodeMode { Proportional, Vertical, Horizontal }
+    // Cross-section outline family. All are sampled by direction angle (same point ordering) so a
+    // segment can morph point-for-point between two different profiles.
+    public enum SpineProfile { Ellipse, Rectangle, Mk2, Mk3 }
 
     // Silhouette of the segment ABOVE this node. Phase 1 implements Linear; the rest in Phase 2.
     public enum SpineSlope { Linear, Concave, Convex, Waisted }
@@ -24,8 +22,10 @@ namespace ProceduralParts
         [Persistent] public float position = 0.5f;   // 0..1 along the spine (0 = bottom, 1 = top)
         [Persistent] public float sizeH = 1.25f;     // horizontal diameter (m), before hScale
         [Persistent] public float sizeV = 1.25f;     // vertical diameter (m), before vScale
+        [Persistent] public float offsetV = 0f;      // vertical centre offset (m), before vScale
+        [Persistent] public float filletTop = 0f;    // top corner rounding, 0..1 of the half-min-extent
+        [Persistent] public float filletBottom = 0f; // bottom corner rounding, 0..1
         [Persistent] public SpineProfile profile = SpineProfile.Ellipse;
-        [Persistent] public SpineNodeMode mode = SpineNodeMode.Proportional;
         [Persistent] public SpineSlope slopeAbove = SpineSlope.Linear;
 
         public SpineNode() { }
@@ -34,8 +34,9 @@ namespace ProceduralParts
         public void Save(ConfigNode node) => ConfigNode.CreateConfigFromObject(this, node);
         public SpineNode Clone() => new SpineNode
         {
-            position = position, sizeH = sizeH, sizeV = sizeV,
-            profile = profile, mode = mode, slopeAbove = slopeAbove,
+            position = position, sizeH = sizeH, sizeV = sizeV, offsetV = offsetV,
+            filletTop = filletTop, filletBottom = filletBottom,
+            profile = profile, slopeAbove = slopeAbove,
         };
     }
 
@@ -61,6 +62,32 @@ namespace ProceduralParts
             UI_FloatEdit(scene = UI_Scene.Editor, incrementSlide = SliderPrecision, sigFigs = 3)]
         public float vScale = 1f;
 
+        // Lifting body: when on, drives the part's stock ModuleLiftingSurface from the planform area so
+        // the body generates lift. (With FAR installed, FAR voxel aero supersedes ModuleLiftingSurface.)
+        // affectSymCounterparts is None: OnAirfoilChanged propagates to counterparts manually. Letting the
+        // stock All fan-out also fire would double-apply and trigger N^2 rebuilds across the symmetry group.
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Airfoil", groupName = ProceduralPart.PAWGroupName),
+            UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
+        public bool airfoil = false;
+
+        // Shell: open both ends and drop the solid interior (a thin skin) -- for custom shrouds / shields.
+        // affectSymCounterparts None: the onFieldChanged -> RebuildAndPropagate -> SyncToSymmetry path
+        // already copies shellMode to and rebuilds every counterpart (stock All would double that to N^2).
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Hollow shell", groupName = ProceduralPart.PAWGroupName),
+            UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
+        public bool shellMode = false;
+        private const float ShellThickness = 0.02f;   // notional wall thickness for the shell's material volume
+
+        // Gizmo behaviour toggles (editor-only prefs). showActiveOnly limits the resize tips to the
+        // selected node (selectors + section glyphs always show).
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Show active node handles only", groupName = ProceduralPart.PAWGroupName),
+            UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
+        public bool showActiveOnly = true;
+
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Must select node before dragging", groupName = ProceduralPart.PAWGroupName),
+            UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
+        public bool requireSelectToDrag = true;
+
         [KSPField] public string TopNodeName = "top";
         [KSPField] public string BottomNodeName = "bottom";
 
@@ -75,38 +102,63 @@ namespace ProceduralParts
             UI_FloatRange(minValue = 0, maxValue = 2, stepIncrement = 1, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
         public float selectedNode = 0;
 
-        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node mode", groupName = ProceduralPart.PAWGroupName),
-            UI_ChooseOption(scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
-        public string nodeModeOpt = "Proportional";
-
-        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node size", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node width", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
             UI_FloatEdit(scene = UI_Scene.Editor, incrementSlide = SliderPrecision, sigFigs = 4, unit = "m", useSI = true, affectSymCounterparts = UI_Scene.None)]
-        public float nodeSize = 1.25f;
+        public float nodeWidth = 1.25f;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node height", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, incrementSlide = SliderPrecision, sigFigs = 4, unit = "m", useSI = true, affectSymCounterparts = UI_Scene.None)]
+        public float nodeHeight = 1.25f;
 
         [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node position", guiFormat = "F3", groupName = ProceduralPart.PAWGroupName),
-            UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0f, maxValue = 1f, incrementSlide = SliderPrecision, sigFigs = 3, affectSymCounterparts = UI_Scene.None)]
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0f, maxValue = 1f, incrementLarge = 0.25f, incrementSmall = 0.05f, incrementSlide = SliderPrecision, sigFigs = 3, affectSymCounterparts = UI_Scene.None)]
         public float nodePos = 0.5f;
 
         [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Slope above", groupName = ProceduralPart.PAWGroupName),
             UI_ChooseOption(scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
         public string nodeSlopeOpt = "Linear";
 
-        [KSPEvent(guiActiveEditor = true, guiName = "Add node", groupName = ProceduralPart.PAWGroupName)]
-        public void AddNodeEvent()
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Section", groupName = ProceduralPart.PAWGroupName),
+            UI_ChooseOption(scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public string nodeProfileOpt = "Ellipse";
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node height offset", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = -10f, maxValue = 10f, incrementLarge = 0.5f, incrementSmall = 0.1f, incrementSlide = SliderPrecision, sigFigs = 3, unit = "m", affectSymCounterparts = UI_Scene.None)]
+        public float nodeOffsetV = 0f;
+
+        // Rectangle: independent top/bottom corner rounding (0 = sharp). Shown only for Rectangle.
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Top fillet", guiFormat = "F2", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatRange(minValue = 0f, maxValue = 1f, stepIncrement = 0.05f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public float nodeFilletTop = 0f;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Bottom fillet", guiFormat = "F2", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatRange(minValue = 0f, maxValue = 1f, stepIncrement = 0.05f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public float nodeFilletBottom = 0f;
+
+        [KSPEvent(guiActiveEditor = true, guiName = "Add node in front", groupName = ProceduralPart.PAWGroupName)]
+        public void AddNodeInFrontEvent() => AddNode(true);
+
+        [KSPEvent(guiActiveEditor = true, guiName = "Add node behind", groupName = ProceduralPart.PAWGroupName)]
+        public void AddNodeBehindEvent() => AddNode(false);
+
+        // Insert a copy of the selected node (same section type / mode / slope / size) toward the +position
+        // (front) or -position (behind) side, halfway to the neighbour (or the spine end).
+        private void AddNode(bool inFront)
         {
             int i = SelIndex;
-            SpineNode a = nodes[i];
-            SpineNode b = nodes[Mathf.Min(i + 1, nodes.Count - 1)];
-            float pos = (i < nodes.Count - 1) ? 0.5f * (a.position + b.position) : Mathf.Clamp01(a.position - 0.1f);
-            var mid = new SpineNode
+            SpineNode cur = nodes[i];
+            float bound = inFront ? ((i < nodes.Count - 1) ? nodes[i + 1].position : 1f)
+                                  : ((i > 0) ? nodes[i - 1].position : 0f);
+            if (Mathf.Abs(bound - cur.position) < 0.02f)
             {
-                position = pos,
-                sizeH = 0.5f * (a.sizeH + b.sizeH),
-                sizeV = 0.5f * (a.sizeV + b.sizeV),
-            };
-            nodes.Add(mid);
+                ScreenMessages.PostScreenMessage($"No room to add a node {(inFront ? "in front" : "behind")}.", 4f, ScreenMessageStyle.UPPER_CENTER);
+                return;
+            }
+            SpineNode add = cur.Clone();
+            add.position = 0.5f * (cur.position + bound);
+            nodes.Add(add);
             SortNodes();
-            selectedNode = nodes.IndexOf(mid);
+            selectedNode = nodes.IndexOf(add);
             RefreshSelector();
             LoadProxyFromNode();
             RebuildAndPropagate();
@@ -131,6 +183,9 @@ namespace ProceduralParts
 
         private int SelIndex => Mathf.Clamp((int)selectedNode, 0, Mathf.Max(0, nodes.Count - 1));
 
+        // The first/last nodes are the spine ends -- pinned fore/aft, can't be repositioned along the axis.
+        private bool IsEndNode(int i) => i == 0 || i == nodes.Count - 1;
+
         #endregion
 
         public override string ShapeKey
@@ -140,6 +195,7 @@ namespace ProceduralParts
                 var sb = new StringBuilder("PP-Spine|").Append(length).Append('|').Append(hScale).Append('|').Append(vScale);
                 foreach (SpineNode n in nodes)
                     sb.Append('|').Append(n.position).Append(',').Append(n.sizeH).Append(',').Append(n.sizeV)
+                      .Append(',').Append(n.offsetV).Append(',').Append(n.filletTop).Append(',').Append(n.filletBottom)
                       .Append(',').Append((int)n.profile).Append(',').Append((int)n.slopeAbove);
                 return sb.ToString();
             }
@@ -171,7 +227,33 @@ namespace ProceduralParts
                 n.Save(node.AddNode("SPINE_NODE"));
         }
 
-        private void SortNodes() => nodes.Sort((a, b) => a.position.CompareTo(b.position));
+        // Editor copy (alt-drag / clone) copies KSPFields but not our node list, so carry it across here.
+        public override void OnCopy(PartModule fromModule)
+        {
+            base.OnCopy(fromModule);
+            if (fromModule is ProceduralShapeSpine src)
+            {
+                nodes.Clear();
+                foreach (SpineNode n in src.nodes) nodes.Add(n.Clone());
+                selectedNode = src.selectedNode;
+            }
+        }
+
+        private void SortNodes()
+        {
+            nodes.Sort((a, b) => a.position.CompareTo(b.position));
+            NormalizeEnds();
+        }
+
+        // The first/last nodes are the spine ends and are pinned at 0/1. Enforcing it here (rather than
+        // only assuming it in the gizmo) keeps the mesh extent aligned with the stack attach nodes even
+        // after a craft loads with off-end positions, or RemoveNode promotes an interior node to an end.
+        private void NormalizeEnds()
+        {
+            if (nodes.Count < 2) return;
+            nodes[0].position = 0f;
+            nodes[nodes.Count - 1].position = 1f;
+        }
 
         // Provide a sensible default spine if the part config / craft supplied none.
         private void EnsureNodes()
@@ -199,14 +281,20 @@ namespace ProceduralParts
                 Fields[nameof(vScale)].uiControlEditor.onFieldChanged = OnShapeDimensionChanged;
 
                 Fields[nameof(selectedNode)].uiControlEditor.onFieldChanged = OnSelectedNodeChanged;
-                UI_ChooseOption modeOpt = Fields[nameof(nodeModeOpt)].uiControlEditor as UI_ChooseOption;
-                modeOpt.options = Enum.GetNames(typeof(SpineNodeMode));
-                modeOpt.onFieldChanged = OnNodeFieldChanged;
                 UI_ChooseOption slopeOpt = Fields[nameof(nodeSlopeOpt)].uiControlEditor as UI_ChooseOption;
                 slopeOpt.options = Enum.GetNames(typeof(SpineSlope));
                 slopeOpt.onFieldChanged = OnNodeFieldChanged;
-                Fields[nameof(nodeSize)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                UI_ChooseOption profOpt = Fields[nameof(nodeProfileOpt)].uiControlEditor as UI_ChooseOption;
+                profOpt.options = Enum.GetNames(typeof(SpineProfile));
+                profOpt.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeWidth)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeHeight)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodePos)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeOffsetV)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeFilletTop)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeFilletBottom)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(airfoil)].uiControlEditor.onFieldChanged = (f, o) => OnAirfoilChanged();
+                Fields[nameof(shellMode)].uiControlEditor.onFieldChanged = (f, o) => RebuildAndPropagate();
 
                 RefreshSelector();
                 LoadProxyFromNode();
@@ -226,11 +314,14 @@ namespace ProceduralParts
             hEdit.incrementLarge = vEdit.incrementLarge = 0.25f;
             hEdit.incrementSmall = vEdit.incrementSmall = 0.05f;
 
-            UI_FloatEdit sizeEdit = Fields[nameof(nodeSize)].uiControlEditor as UI_FloatEdit;
-            sizeEdit.minValue = MinSize;
-            sizeEdit.maxValue = MaxSize;
-            sizeEdit.incrementLarge = PPart.diameterLargeStep;
-            sizeEdit.incrementSmall = PPart.diameterSmallStep;
+            foreach (string fn in new[] { nameof(nodeWidth), nameof(nodeHeight) })
+            {
+                UI_FloatEdit e = Fields[fn].uiControlEditor as UI_FloatEdit;
+                e.minValue = MinSize;
+                e.maxValue = MaxSize;
+                e.incrementLarge = PPart.diameterLargeStep;
+                e.incrementSmall = PPart.diameterSmallStep;
+            }
 
             ClampNodeSizes();   // heal any out-of-range sizes from older builds/crafts
             AdjustDimensionBounds();
@@ -248,6 +339,10 @@ namespace ProceduralParts
         // synchronously rebuild the PAW and re-fire our proxy field handlers -> guard against that
         // re-entering and recursively mangling the node sizes (it was a stack overflow / crash).
         private bool _rebuilding;
+
+        // Top-view planform area (m^2), integrated from the rings; drives the lifting-surface coeff.
+        private float _planformArea;
+        private const float PlanformLiftFactor = 1f;   // deflectionLiftCoeff per m^2 of planform
 
         internal override void UpdateShape(bool force = true)
         {
@@ -273,11 +368,14 @@ namespace ProceduralParts
             Length = length;
 
             GenerateSideMesh(rings);
-            GenerateCapMesh(rings);
+            GenerateCapMesh(rings);          // emits empty end meshes when shellMode (open ends)
             GenerateColliderMesh(rings);
 
             UpdateNodeSize(BottomNodeName, EndDiameter(0));
             UpdateNodeSize(TopNodeName, EndDiameter(rings.Count - 1));
+
+            _planformArea = PlanformArea(rings);
+            ApplyLiftingSurface();
 
             // Set volume last (the setter fires OnPartVolumeChanged / onEditorShipModified) so the
             // visible mesh is already updated even if a volume listener throws.
@@ -294,7 +392,231 @@ namespace ProceduralParts
             }
         }
 
-        private struct Ring { public float y, rH, rV; }
+        // A loft ring: position + half-extents (for diameter) + vertical centre offset + the precomputed
+        // Sides-point boundary outline (profile morph already applied).
+        private struct Ring { public float y, rH, rV, offsetZ; public Vector2[] outline; }
+
+        // 3D vertex of ring outline point j (index wraps), at the ring's y, shifted by its vertical offset.
+        private static Vector3 RingV(Ring ring, int j)
+        {
+            int n = ring.outline.Length;
+            Vector2 p = ring.outline[((j % n) + n) % n];
+            return new Vector3(p.x, ring.y, p.y + ring.offsetZ);
+        }
+
+        // Sides-point outline of a ring, morphing profile pa->pb by blend, scaled to rH x rV, with the
+        // top/bottom fillet fractions also blended (a..b) for the rounded-rect profiles.
+        private static Vector2[] RingOutline(SpineProfile pa, SpineProfile pb, float blend,
+                                             float rH, float rV, float ftA, float fbA, float ftB, float fbB)
+        {
+            Vector2[] a = ProfileOutline(pa, rH, rV, ftA, fbA);
+            if (blend <= 0f || (pa == pb && ftA == ftB && fbA == fbB)) return a;
+            Vector2[] b = ProfileOutline(pb, rH, rV, ftB, fbB);
+            var o = new Vector2[Sides];
+            for (int j = 0; j < Sides; j++) o[j] = Vector2.Lerp(a[j], b[j], blend);
+            return o;
+        }
+
+        // Sides boundary points of a profile scaled to rH x rV. Each profile has a FIXED Sides-point
+        // topology (its corners forced to vertices) so flats stay flat, corners stay crisp, and rings
+        // of the same profile loft with aligned edges. Rectangle and Mk3 are rounded rectangles whose
+        // corner radii come from the top/bottom fillet fractions (0 = sharp corner).
+        private static Vector2[] ProfileOutline(SpineProfile profile, float rH, float rV, float ftFrac, float fbFrac)
+        {
+            switch (profile)
+            {
+                case SpineProfile.Rectangle: return BuildRoundedRect(rH, rV, ftFrac, fbFrac);
+                case SpineProfile.Mk3: return BuildMk3Outline(rH, rV);
+            }
+
+            Vector2[] unit = (profile == SpineProfile.Mk2) ? UnitMk2 : UnitCircle;   // Mk2 / Ellipse
+            Vector2 scale = new Vector2(rH, rV);
+            var o = new Vector2[Sides];
+            for (int j = 0; j < Sides; j++) o[j] = Vector2.Scale(unit[j], scale);
+            return o;
+        }
+
+        // Rounded rectangle: half-extents (rH, rV), independent top/bottom corner radii from the fillet
+        // fractions (of the smaller half-extent). Tangent points are forced so the flats stay flat; the
+        // fillet arcs are sampled smoothly. Fillet 0 -> a forced sharp corner.
+        private static Vector2[] BuildRoundedRect(float rH, float rV, float ftFrac, float fbFrac)
+        {
+            float m = Mathf.Min(rH, rV);
+            float tr = Mathf.Clamp01(ftFrac) * m;
+            float br = Mathf.Clamp01(fbFrac) * m;
+            var pts = new List<Vector2>();
+            var corners = new List<int>();
+            pts.Add(new Vector2(rH, 0f));                                                          // index 0: mid right edge
+            AddFillet(pts, corners, new Vector2(rH - tr, rV - tr), tr, 0f, 90f, new Vector2(rH, rV));      // top-right
+            AddFillet(pts, corners, new Vector2(-(rH - tr), rV - tr), tr, 90f, 180f, new Vector2(-rH, rV)); // top-left
+            AddFillet(pts, corners, new Vector2(-(rH - br), -(rV - br)), br, 180f, 270f, new Vector2(-rH, -rV)); // bottom-left
+            AddFillet(pts, corners, new Vector2(rH - br, -(rV - br)), br, 270f, 360f, new Vector2(rH, -rV));     // bottom-right
+            return ResampleWithCorners(pts, corners, Sides);
+        }
+
+        // Append one corner: a quarter arc of `radius` about `center` (left smooth so arc-length sampling
+        // rounds it evenly), or a single forced-sharp point when the radius is ~0.
+        private static void AddFillet(List<Vector2> pts, List<int> corners, Vector2 center, float radius,
+                                      float startDeg, float endDeg, Vector2 sharp)
+        {
+            if (radius < 1e-4f) { corners.Add(pts.Count); pts.Add(sharp); return; }
+            const int steps = 8;
+            for (int i = 0; i <= steps; i++)
+            {
+                float a = Mathf.Deg2Rad * Mathf.Lerp(startDeg, endDeg, (float)i / steps);
+                pts.Add(center + new Vector2(Mathf.Cos(a), Mathf.Sin(a)) * radius);
+            }
+        }
+
+        // Mk3: a vertical circle (radius = rV) with its left/right sides sliced off flat at x = +/-rH, so
+        // the top/bottom are arcs and the sides are flats (the real Mk3 is a 3.75 m circle cut to 3.25 m
+        // wide). The 4 flat/arc junctions are forced sharp. If rH >= rV there's no truncation -> ellipse.
+        private static Vector2[] BuildMk3Outline(float rH, float rV)
+        {
+            float R = rV;
+            if (rH >= R)
+            {
+                var e = new Vector2[Sides];
+                for (int j = 0; j < Sides; j++) { float a = 2f * Mathf.PI * j / Sides; e[j] = new Vector2(Mathf.Cos(a) * rH, Mathf.Sin(a) * rV); }
+                return e;
+            }
+            float yc = Mathf.Sqrt(Mathf.Max(0f, R * R - rH * rH));   // flat/arc junction height
+            float tc = Mathf.Atan2(yc, rH);                          // junction angle
+            const int arc = 10;
+            var pts = new List<Vector2>();
+            var corners = new List<int>();
+            corners.Add(pts.Count); pts.Add(new Vector2(rH, -yc));   // right flat, bottom
+            corners.Add(pts.Count); pts.Add(new Vector2(rH, yc));    // right flat, top
+            for (int i = 1; i < arc; i++) { float a = Mathf.Lerp(tc, Mathf.PI - tc, (float)i / arc); pts.Add(new Vector2(Mathf.Cos(a) * R, Mathf.Sin(a) * R)); }  // top arc
+            corners.Add(pts.Count); pts.Add(new Vector2(-rH, yc));   // left flat, top
+            corners.Add(pts.Count); pts.Add(new Vector2(-rH, -yc));  // left flat, bottom
+            for (int i = 1; i < arc; i++) { float a = Mathf.Lerp(Mathf.PI + tc, 2f * Mathf.PI - tc, (float)i / arc); pts.Add(new Vector2(Mathf.Cos(a) * R, Mathf.Sin(a) * R)); }  // bottom arc
+            return ResampleWithCorners(pts, corners, Sides);
+        }
+
+        // Unit outlines in the [-1,1] box, Sides points each, starting near +x going CCW.
+        private static Vector2[] _unitCircle, _unitRect, _unitMk2;
+        private static Vector2[] UnitCircle
+        {
+            get
+            {
+                if (_unitCircle == null)
+                {
+                    _unitCircle = new Vector2[Sides];
+                    for (int j = 0; j < Sides; j++) { float a = 2f * Mathf.PI * j / Sides; _unitCircle[j] = new Vector2(Mathf.Cos(a), Mathf.Sin(a)); }
+                }
+                return _unitCircle;
+            }
+        }
+        private static Vector2[] UnitRect => _unitRect ??= ResampleWithCorners(
+            new List<Vector2> { new Vector2(1f, -1f), new Vector2(1f, 1f), new Vector2(-1f, 1f), new Vector2(-1f, -1f) },
+            new List<int> { 0, 1, 2, 3 }, Sides);
+        private static Vector2[] UnitMk2
+        {
+            get
+            {
+                if (_unitMk2 == null) { Vector2[] poly = BuildMk2Unit(out List<int> corners); _unitMk2 = ResampleWithCorners(new List<Vector2>(poly), corners, Sides); }
+                return _unitMk2;
+            }
+        }
+
+        // Resample a closed polygon to N points by arc length, forcing the corner vertices to be kept
+        // (flats stay flat, corners stay crisp).
+        private static Vector2[] ResampleWithCorners(IList<Vector2> verts, IList<int> cornerIdx, int N)
+        {
+            int M = verts.Count;
+            float[] arcAt = new float[M + 1];
+            for (int i = 0; i < M; i++) arcAt[i + 1] = arcAt[i] + (verts[(i + 1) % M] - verts[i]).magnitude;
+            float perim = arcAt[M];
+            var targets = new List<float>();
+            foreach (int ci in cornerIdx) targets.Add(arcAt[ci]);
+            int fills = Mathf.Max(0, N - cornerIdx.Count);
+            for (int i = 0; i < fills; i++) targets.Add((i + 0.5f) / fills * perim);
+            targets.Sort();
+            var outp = new Vector2[N];
+            for (int k = 0; k < N; k++) outp[k] = PointAtArc(verts, arcAt, perim, targets[k]);
+            return outp;
+        }
+
+        private static Vector2 PointAtArc(IList<Vector2> verts, float[] arcAt, float perim, float arc)
+        {
+            int M = verts.Count;
+            arc = Mathf.Clamp(arc, 0f, perim);
+            for (int i = 0; i < M; i++)
+            {
+                if (arc <= arcAt[i + 1] + 1e-6f)
+                {
+                    float seg = arcAt[i + 1] - arcAt[i];
+                    float u = (seg > 1e-9f) ? (arc - arcAt[i]) / seg : 0f;
+                    return Vector2.Lerp(verts[i], verts[(i + 1) % M], u);
+                }
+            }
+            return verts[0];
+        }
+
+        // --- Mk2 cross-section (ported from ProceduralShapeMk2) ---
+        // Proportions as ratios of the half-width, calibrated against the real Mk2.
+        private const float Mk2HeightRatio = 0.6047f;    // full height / full width
+        private const float Mk2SideFlatRatio = 0.11907f; // side-flat half-height / half-width
+        private const float Mk2RoundRatio = 0.63628f;    // top/bottom arc radius / half-width
+
+        // Mk2 silhouette polygon normalized into [-1,1]^2; cornerIdx = the 4 hard shoulder vertices.
+        private static Vector2[] BuildMk2Unit(out List<int> cornerIdx)
+        {
+            const float hw = 1f;
+            float hh = Mk2HeightRatio * hw, sf = Mk2SideFlatRatio * hw, tr = Mk2RoundRatio * hw;
+            Vector2 pRt = new Vector2(hw, sf), pRb = new Vector2(hw, -sf);
+            Vector2 pLt = new Vector2(-hw, sf), pLb = new Vector2(-hw, -sf);
+            Vector2 cTop = new Vector2(0f, hh - tr);
+            Vector2 tUr = Mk2Tangent(pRt, cTop, tr);
+            Vector2 tUl = new Vector2(-tUr.x, tUr.y);
+            Vector2 tLr = new Vector2(tUr.x, -tUr.y);
+            Vector2 tLl = new Vector2(-tUr.x, -tUr.y);
+            float thR = Mathf.Atan2(tUr.y - cTop.y, tUr.x - cTop.x), thL = Mathf.PI - thR;
+            const int arc = 12;
+
+            var pts = new List<Vector2>();
+            cornerIdx = new List<int>();
+            cornerIdx.Add(pts.Count); pts.Add(pRb);     // right-bottom shoulder
+            cornerIdx.Add(pts.Count); pts.Add(pRt);     // right-top shoulder
+            pts.Add(tUr);                                // up-right diagonal end
+            for (int k = 1; k < arc; k++) { float th = thR + (thL - thR) * k / arc; pts.Add(cTop + new Vector2(Mathf.Cos(th), Mathf.Sin(th)) * tr); }
+            pts.Add(tUl);
+            cornerIdx.Add(pts.Count); pts.Add(pLt);     // left-top shoulder
+            cornerIdx.Add(pts.Count); pts.Add(pLb);     // left-bottom shoulder
+            pts.Add(tLl);                                // low-left diagonal end
+            for (int k = arc - 1; k >= 1; k--) { float th = thR + (thL - thR) * k / arc; pts.Add(new Vector2(Mathf.Cos(th) * tr, -(cTop.y + Mathf.Sin(th) * tr))); }
+            pts.Add(tLr);                                // bottom arc end + low-right diagonal closes to pRb
+
+            for (int i = 0; i < pts.Count; i++) pts[i] = new Vector2(pts[i].x, pts[i].y / hh);   // normalize y to [-1,1]
+            return pts.ToArray();
+        }
+
+        // Tangent point on circle (centre C, radius r) from external point P, toward the cap apex.
+        private static Vector2 Mk2Tangent(Vector2 P, Vector2 C, float r)
+        {
+            Vector2 d = P - C;
+            float dist = d.magnitude;
+            float a = Mathf.Atan2(d.y, d.x);
+            float b = Mathf.Acos(Mathf.Clamp(r / dist, -1f, 1f));
+            Vector2 t1 = C + new Vector2(Mathf.Cos(a + b), Mathf.Sin(a + b)) * r;
+            Vector2 t2 = C + new Vector2(Mathf.Cos(a - b), Mathf.Sin(a - b)) * r;
+            return (Mathf.Abs(t1.y) >= Mathf.Abs(t2.y)) ? t1 : t2;
+        }
+
+        // Polygon area of a ring's outline (shoelace), used for an accurate volume of any profile.
+        private static float RingArea(Ring ring)
+        {
+            Vector2[] o = ring.outline;
+            int n = o.Length;
+            float area = 0f;
+            for (int j = 0; j < n; j++)
+            {
+                Vector2 prev = o[(j + n - 1) % n], cur = o[j];
+                area += prev.x * cur.y - cur.x * prev.y;
+            }
+            return Mathf.Abs(area) * 0.5f;
+        }
 
         // Sane size bounds. A node "size" is a cross-section diameter. The hard 100 m cap on the
         // effective (scaled) radius keeps the volume well within the SI formatter's range -- an
@@ -312,17 +634,25 @@ namespace ProceduralParts
             }
         }
 
-        private Ring NodeRing(SpineNode n) => new Ring
+        // Effective (scaled) half-extents of a node, clamped finite/positive.
+        private float Erh(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeH * hScale, 0.05f, 100f);
+        private float Erv(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeV * vScale, 0.05f, 100f);
+        private float Eoff(SpineNode n) => Mathf.Clamp(n.offsetV * vScale, -100f, 100f);
+        private float NodeY(SpineNode n) => (n.position - 0.5f) * length;
+
+        private Ring NodeRing(SpineNode n)
         {
-            y = (n.position - 0.5f) * length,
-            // Clamp to a finite positive radius so the volume can never go to 0/NaN/Infinity (which
-            // the volume listeners reject) or so large the SI formatter overflows.
-            rH = 0.5f * Mathf.Clamp(n.sizeH * hScale, 0.05f, 100f),
-            rV = 0.5f * Mathf.Clamp(n.sizeV * vScale, 0.05f, 100f),
-        };
+            float rH = Erh(n), rV = Erv(n);
+            return new Ring
+            {
+                y = NodeY(n), rH = rH, rV = rV, offsetZ = Eoff(n),
+                outline = RingOutline(n.profile, n.profile, 0f, rH, rV, n.filletTop, n.filletBottom, n.filletTop, n.filletBottom),
+            };
+        }
 
         // Build the loft rings, subdividing each segment per its lower node's slopeAbove so the
-        // silhouette curves (concave/convex/waisted). Linear segments need no extra rings.
+        // silhouette curves (concave/convex/waisted), and morphing the cross-section profile from the
+        // lower node's to the upper node's across the segment. Linear/same-profile segments stay coarse.
         private List<Ring> BuildRings()
         {
             EnsureNodes();
@@ -330,20 +660,31 @@ namespace ProceduralParts
             var rings = new List<Ring> { NodeRing(nodes[0]) };
             for (int i = 1; i < nodes.Count; i++)
             {
-                Ring a = NodeRing(nodes[i - 1]);
-                Ring b = NodeRing(nodes[i]);
-                SpineSlope slope = nodes[i - 1].slopeAbove;
-                int k = (slope == SpineSlope.Linear) ? 1 : 10;
+                SpineNode lo = nodes[i - 1], hi = nodes[i];
+                float aY = NodeY(lo), bY = NodeY(hi), aH = Erh(lo), aV = Erv(lo), bH = Erh(hi), bV = Erv(hi);
+                float aOff = Eoff(lo), bOff = Eoff(hi);
+                SpineSlope slope = lo.slopeAbove;
+                // Fillets only change the outline for Rectangle, so a fillet difference only forces
+                // subdivision when both ends are rectangles (Mk2/Mk3/Ellipse ignore the fillet values).
+                bool filletMorph = lo.profile == SpineProfile.Rectangle && hi.profile == SpineProfile.Rectangle
+                                   && (lo.filletTop != hi.filletTop || lo.filletBottom != hi.filletBottom);
+                bool morph = lo.profile != hi.profile || filletMorph;
+                int k = (slope == SpineSlope.Linear && !morph) ? 1 : 10;
                 for (int s = 1; s <= k; s++)
                 {
                     float t = (float)s / k;
                     float h = SlopeBlend(slope, t);
                     float w = WaistFactor(slope, t);
+                    float rH = Mathf.Lerp(aH, bH, h) * w;
+                    float rV = Mathf.Lerp(aV, bV, h) * w;
                     rings.Add(new Ring
                     {
-                        y = Mathf.Lerp(a.y, b.y, t),
-                        rH = Mathf.Lerp(a.rH, b.rH, h) * w,
-                        rV = Mathf.Lerp(a.rV, b.rV, h) * w,
+                        y = Mathf.Lerp(aY, bY, t),
+                        rH = rH,
+                        rV = rV,
+                        offsetZ = Mathf.Lerp(aOff, bOff, h),
+                        outline = RingOutline(lo.profile, hi.profile, t, rH, rV,
+                                              lo.filletTop, lo.filletBottom, hi.filletTop, hi.filletBottom),
                     });
                 }
             }
@@ -365,6 +706,49 @@ namespace ProceduralParts
         private static float WaistFactor(SpineSlope slope, float t) =>
             slope == SpineSlope.Waisted ? 1f - 0.35f * Mathf.Sin(Mathf.PI * t) : 1f;
 
+        // Lateral (skin) surface area: each segment's average perimeter times its length.
+        private static float LateralArea(List<Ring> rings)
+        {
+            float area = 0f;
+            float prevP = OutlinePerimeter(rings[0].outline);
+            for (int i = 1; i < rings.Count; i++)
+            {
+                float p = OutlinePerimeter(rings[i].outline);
+                area += 0.5f * (prevP + p) * Mathf.Abs(rings[i].y - rings[i - 1].y);
+                prevP = p;
+            }
+            return area;
+        }
+
+        // Top-view planform area: trapezoidal integral of the full width (2*rH) along the spine.
+        private static float PlanformArea(List<Ring> rings)
+        {
+            float area = 0f;
+            for (int i = 1; i < rings.Count; i++)
+            {
+                float w0 = 2f * rings[i - 1].rH, w1 = 2f * rings[i].rH;
+                area += 0.5f * (w0 + w1) * Mathf.Abs(rings[i].y - rings[i - 1].y);
+            }
+            return area;
+        }
+
+        // Drive the part's stock ModuleLiftingSurface from the planform: lift scales with area when the
+        // Airfoil toggle is on, zero when off. No-op if the part has no lifting-surface module.
+        private void ApplyLiftingSurface()
+        {
+            ModuleLiftingSurface ls = part.FindModuleImplementing<ModuleLiftingSurface>();
+            if (ls == null) return;
+            ls.deflectionLiftCoeff = airfoil ? Mathf.Max(0.01f, _planformArea * PlanformLiftFactor) : 0f;
+        }
+
+        // Toggling Airfoil doesn't change geometry, so just re-apply the coeff here and on counterparts.
+        private void OnAirfoilChanged()
+        {
+            ApplyLiftingSurface();
+            foreach (Part p in part.symmetryCounterparts)
+                if (FindAbstractShapeModule(p, this) is ProceduralShapeSpine pm) { pm.airfoil = airfoil; pm.ApplyLiftingSurface(); }
+        }
+
         // Bounding diameter of an end ring (used for stack node sizing).
         private float EndDiameter(int ringIndex)
         {
@@ -375,19 +759,21 @@ namespace ProceduralParts
 
         public override float CalculateVolume() => CalculateVolume(BuildRings());
 
-        // Simpson integration of the elliptical section area along the spine (exact for the linear
-        // radius taper of Phase 1; still a good approximation once slope curves arrive).
+        // Trapezoidal integration of the actual section area (shoelace of each ring's outline) along
+        // the spine -- correct for any profile (ellipse/rect/Mk2/Mk3). A shell only contains its thin
+        // wall material, so it reports the lateral skin area * a notional wall thickness instead. Both
+        // the Volume property and this override use this single definition so SeekVolume / volume bounds
+        // stay self-consistent in either mode. Subdivided rings keep it tight.
         private float CalculateVolume(List<Ring> rings)
         {
+            if (shellMode) return LateralArea(rings) * ShellThickness;
             float v = 0f;
-            for (int i = 0; i < rings.Count - 1; i++)
+            float prevArea = RingArea(rings[0]);
+            for (int i = 1; i < rings.Count; i++)
             {
-                Ring a = rings[i], b = rings[i + 1];
-                float dy = b.y - a.y;
-                float aArea = Mathf.PI * a.rH * a.rV;
-                float bArea = Mathf.PI * b.rH * b.rV;
-                float mArea = Mathf.PI * (0.5f * (a.rH + b.rH)) * (0.5f * (a.rV + b.rV));
-                v += dy / 6f * (aArea + 4f * mArea + bArea);
+                float area = RingArea(rings[i]);
+                v += (rings[i].y - rings[i - 1].y) * 0.5f * (prevArea + area);
+                prevArea = area;
             }
             return Mathf.Abs(v);
         }
@@ -457,20 +843,39 @@ namespace ProceduralParts
         {
             if (nodes.Count == 0) return;
             SpineNode n = nodes[SelIndex];
-            nodeModeOpt = n.mode.ToString();
             nodeSlopeOpt = n.slopeAbove.ToString();
+            nodeProfileOpt = n.profile.ToString();
             nodePos = n.position;
-            nodeSize = SizeForMode(n);
+            nodeWidth = n.sizeH;
+            nodeHeight = n.sizeV;
+            nodeOffsetV = n.offsetV;
+            nodeFilletTop = n.filletTop;
+            nodeFilletBottom = n.filletBottom;
+            Fields[nameof(nodePos)].guiActiveEditor = !IsEndNode(SelIndex);   // end nodes are pinned fore/aft
+            UpdateFilletVisibility(n.profile);
+            UpdateAddButtons();
         }
 
-        private static float SizeForMode(SpineNode n)
+        // The fillet sliders only apply to the Rectangle profile (top/bottom corner rounding).
+        private void UpdateFilletVisibility(SpineProfile p)
         {
-            switch (n.mode)
-            {
-                case SpineNodeMode.Vertical: return n.sizeV;
-                case SpineNodeMode.Horizontal: return n.sizeH;
-                default: return Mathf.Max(n.sizeH, n.sizeV);
-            }
+            bool rect = p == SpineProfile.Rectangle;
+            Fields[nameof(nodeFilletTop)].guiActiveEditor = rect;
+            Fields[nameof(nodeFilletBottom)].guiActiveEditor = rect;
+        }
+
+        // At each end of the spine only the inward insert makes sense: the top node (highest position /
+        // last index) hides "in front", the bottom node (index 0) hides "behind". The end nodes are also
+        // pinned, so they can't be removed (Remove hidden there too).
+        private void UpdateAddButtons()
+        {
+            bool isEnd = IsEndNode(SelIndex);
+            BaseEvent front = Events[nameof(AddNodeInFrontEvent)];
+            BaseEvent behind = Events[nameof(AddNodeBehindEvent)];
+            BaseEvent remove = Events[nameof(RemoveNodeEvent)];
+            if (front != null) front.guiActiveEditor = SelIndex != nodes.Count - 1;
+            if (behind != null) behind.guiActiveEditor = SelIndex != 0;
+            if (remove != null) remove.guiActiveEditor = !isEnd;
         }
 
         private void OnSelectedNodeChanged(BaseField f, object obj)
@@ -482,7 +887,8 @@ namespace ProceduralParts
             MonoUtilities.RefreshPartContextWindow(part);
         }
 
-        // A proxy field (mode/size/position/slope) changed -> write back to the selected node.
+        // A single proxy field changed -> write just that field back to the selected node (the other
+        // proxies stay authoritative, so they can't be clobbered if load/change ever drift out of sync).
         private void OnNodeFieldChanged(BaseField f, object obj)
         {
             // Ignore re-fires triggered by our own rebuild (the Volume setter can synchronously
@@ -494,45 +900,33 @@ namespace ProceduralParts
             Debug.Log($"{ModTag} OnNodeFieldChanged {f.name}: {obj} -> {f.GetValue(this)} | sel={SelIndex}/{nodes.Count} before: {Dump(n)}");
             try
             {
-                n.mode = ParseEnum(nodeModeOpt, SpineNodeMode.Proportional);
-                n.slopeAbove = ParseEnum(nodeSlopeOpt, SpineSlope.Linear);
-
-                // Position is clamped strictly between the neighbours so a node can't cross another.
-                int idx = SelIndex;
-                float loPos = (idx > 0) ? nodes[idx - 1].position + 0.01f : 0f;
-                float hiPos = (idx < nodes.Count - 1) ? nodes[idx + 1].position - 0.01f : 1f;
-                if (loPos > hiPos) loPos = hiPos = 0.5f * (loPos + hiPos);
-                n.position = Mathf.Clamp(nodePos, loPos, hiPos);
-                nodePos = n.position;   // reflect the clamp in the slider
-
-                if (f.name == nameof(nodeSize))
+                switch (f.name)
                 {
-                    float size = Mathf.Clamp(nodeSize, MinSize, MaxSize);
-                    switch (n.mode)
-                    {
-                        case SpineNodeMode.Vertical: n.sizeV = size; break;
-                        case SpineNodeMode.Horizontal: n.sizeH = size; break;
-                        default:
-                            // Proportional: drive max(sizeH,sizeV) to `size`, preserving aspect ratio.
-                            // Computed from the CURRENT sizes (not the event's old value) so a repeated
-                            // fire is idempotent (ratio -> 1) and can never compound.
-                            float curMax = Mathf.Max(n.sizeH, n.sizeV);
-                            float ratio = (curMax > 0f) ? size / curMax : 1f;
-                            n.sizeH *= ratio;
-                            n.sizeV *= ratio;
-                            break;
-                    }
-                    n.sizeH = Mathf.Clamp(n.sizeH, MinSize, MaxSize);
-                    n.sizeV = Mathf.Clamp(n.sizeV, MinSize, MaxSize);
-                }
-                else if (f.name == nameof(nodeModeOpt))
-                {
-                    // Switching mode just changes what the Size slider means; refresh its display.
-                    nodeSize = SizeForMode(n);
-                    MonoUtilities.RefreshPartContextWindow(part);
+                    case nameof(nodeSlopeOpt): n.slopeAbove = ParseEnum(nodeSlopeOpt, SpineSlope.Linear); break;
+                    case nameof(nodeWidth): n.sizeH = nodeWidth = Mathf.Clamp(nodeWidth, MinSize, MaxSize); break;
+                    case nameof(nodeHeight): n.sizeV = nodeHeight = Mathf.Clamp(nodeHeight, MinSize, MaxSize); break;
+                    case nameof(nodeOffsetV): n.offsetV = nodeOffsetV = Mathf.Clamp(nodeOffsetV, -10f, 10f); break;
+                    case nameof(nodeFilletTop): n.filletTop = nodeFilletTop = Mathf.Clamp01(nodeFilletTop); break;
+                    case nameof(nodeFilletBottom): n.filletBottom = nodeFilletBottom = Mathf.Clamp01(nodeFilletBottom); break;
+                    case nameof(nodeProfileOpt):
+                        n.profile = ParseEnum(nodeProfileOpt, SpineProfile.Ellipse);
+                        UpdateFilletVisibility(n.profile);
+                        MonoUtilities.RefreshPartContextWindow(part);
+                        break;
+                    case nameof(nodePos):
+                        // Position is clamped strictly between the neighbours; end nodes are pinned.
+                        if (!IsEndNode(SelIndex))
+                        {
+                            float loPos = (SelIndex > 0) ? nodes[SelIndex - 1].position + 0.01f : 0f;
+                            float hiPos = (SelIndex < nodes.Count - 1) ? nodes[SelIndex + 1].position - 0.01f : 1f;
+                            if (loPos > hiPos) loPos = hiPos = 0.5f * (loPos + hiPos);
+                            n.position = Mathf.Clamp(nodePos, loPos, hiPos);
+                        }
+                        nodePos = n.position;   // reflect the clamp / pin in the slider
+                        break;
                 }
 
-                // Position edits can reorder; keep the selection on the same node.
+                // A position edit can reorder; keep the selection on the same node.
                 SortNodes();
                 selectedNode = Mathf.Clamp(nodes.IndexOf(n), 0, nodes.Count - 1);
                 RebuildAndPropagate();
@@ -544,7 +938,7 @@ namespace ProceduralParts
             }
         }
 
-        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} mode={n.mode} slope={n.slopeAbove}]";
+        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} off={n.offsetV:F3} fil={n.filletTop:F2}/{n.filletBottom:F2} prof={n.profile} slope={n.slopeAbove}]";
         private string DumpAll() => string.Join(" ", nodes.ConvertAll(Dump).ToArray()) + $" | len={length:F3} hS={hScale:F3} vS={vScale:F3}";
 
         private static T ParseEnum<T>(string s, T fallback) where T : struct =>
@@ -557,6 +951,12 @@ namespace ProceduralParts
             SyncToSymmetry();
         }
 
+        // Lightweight rebuild for continuous gizmo drags: refresh this part's mesh only, deferring the
+        // expensive FAR/TestFlight interop and the per-counterpart symmetry rebuild to drag end (a full
+        // RebuildAndPropagate fires once on mouse-up), so a drag doesn't re-voxelise and re-mesh the whole
+        // symmetry group every frame.
+        private void RebuildLive() => UpdateShape();
+
         // The node list isn't a scalar KSPField, so symmetry isn't auto-mirrored. Copy our state to
         // each counterpart's spine module and rebuild it.
         private void SyncToSymmetry()
@@ -568,6 +968,8 @@ namespace ProceduralParts
                     pm.length = length;
                     pm.hScale = hScale;
                     pm.vScale = vScale;
+                    pm.airfoil = airfoil;
+                    pm.shellMode = shellMode;
                     pm.selectedNode = selectedNode;
                     pm.nodes.Clear();
                     foreach (SpineNode n in nodes) pm.nodes.Add(n.Clone());
@@ -580,52 +982,495 @@ namespace ProceduralParts
 
         #endregion
 
-        #region Editor gizmo (visualization)
+        #region Editor gizmo (interactive)
 
-        // One handle sphere per node, on the node's top surface. Highlights the selected node so you
-        // can see which node the PAW controls are editing. Visualization only for now -- dragging /
-        // wheel / middle-click come in the interactive pass. Update() only runs while this shape is
-        // the active (enabled) one; OnDisable cleans up when you switch shapes.
-        private readonly List<GameObject> _handles = new List<GameObject>();
+        // Per node, billboarded glyphs drawn through the hull:
+        //   * a circle marker at the node centre          -> select; drag = move the node up/down
+        //                                                    (vertical offset); wheel = taller/shorter
+        //   * the section-type glyph just above            -> select; middle-click cycles Ellipse ->
+        //                                                    Rectangle -> Mk2 -> Mk3
+        //   * two tip handles at the section's left/right  -> B9-style: drag out/in = widen/narrow,
+        //     edges                                          drag along the spine = move forward/back
+        // Update() only runs while this shape is the active (enabled) one.
+        private enum HoverKind { None, Node, Profile, TipLeft, TipRight }
+        private readonly List<GameObject> _nodeHandles = new List<GameObject>();   // circle marker
+        private readonly List<GameObject> _profIcons = new List<GameObject>();     // section glyph (above)
+        private readonly List<GameObject> _leftTips = new List<GameObject>();      // left mesh-edge handle
+        private readonly List<GameObject> _rightTips = new List<GameObject>();     // right mesh-edge handle
+        private int _dragIndex = -1;     // node being vertically dragged
+        private int _tipDragIndex = -1;  // node whose tip is being dragged
+        private int _tipSide;            // -1 = left tip, +1 = right tip
+        // Offset between the grabbed value and the cursor at mouse-down, so a drag moves the value by the
+        // cursor delta instead of snapping it to wherever the (possibly off-centre) grab landed.
+        private float _grabDeltaV, _grabDeltaW, _grabDeltaP;
+        private bool _inputLocked;
+        private const ControlTypes GizmoLockMask = ControlTypes.EDITOR_PAD_PICK_PLACE | ControlTypes.CAMERACONTROLS;
+        private string GizmoLockId => "SpineGizmo_" + GetInstanceID();
 
         public void Update()
         {
-            if (!HighLogic.LoadedSceneIsEditor || nodes.Count == 0) { DestroyHandles(); return; }
-            while (_handles.Count < nodes.Count) _handles.Add(CreateHandle());
-            while (_handles.Count > nodes.Count)
+            // Only the active Spine shape on a selected part drives gizmos. A disabled shape module stops
+            // getting Update() (so it would leave its handles orphaned); guarding here also covers a stale
+            // active shape and hides the gizmos once the part's PAW closes (part deselected).
+            bool selected = part.PartActionWindow != null && part.PartActionWindow.isActiveAndEnabled;
+            if (!HighLogic.LoadedSceneIsEditor || nodes.Count == 0 || PPart == null || PPart.CurrentShape != this || !selected)
             {
-                GameObject extra = _handles[_handles.Count - 1];
-                _handles.RemoveAt(_handles.Count - 1);
-                if (extra != null) Destroy(extra);
+                CleanupGizmo();
+                return;
             }
+
+            SyncHandleCount(_nodeHandles, "SpineNodeHandle");
+            SyncHandleCount(_profIcons, "SpineProfileIcon");
+            SyncHandleCount(_leftTips, "SpineTipL");
+            SyncHandleCount(_rightTips, "SpineTipR");
+
+            Camera cam = GizmoCam;
             int sel = SelIndex;
+            HoverKind hoverKind = HoverKind.None;
+            int hover = -1;
+            if (_dragIndex >= 0) { hover = _dragIndex; hoverKind = HoverKind.Node; }
+            else if (_tipDragIndex >= 0) { hover = _tipDragIndex; hoverKind = (_tipSide < 0) ? HoverKind.TipLeft : HoverKind.TipRight; }
+            else if (cam != null) hover = ComputeHover(cam, out hoverKind);
+
+            Quaternion rot = (cam != null) ? cam.transform.rotation : Quaternion.identity;
+            Vector3 up = (cam != null) ? cam.transform.up : Vector3.up;
+
             for (int i = 0; i < nodes.Count; i++)
             {
-                SpineNode n = nodes[i];
-                float y = (n.position - 0.5f) * length;
-                GameObject h = _handles[i];
-                if (h == null) { _handles[i] = h = CreateHandle(); }
-                h.transform.SetParent(part.transform, false);
-                h.transform.localPosition = new Vector3(0f, y, 0f);   // on the spine axis
-                h.transform.localRotation = Quaternion.identity;
-                h.transform.localScale = Vector3.one * (i == sel ? 0.22f : 0.15f);
-                h.layer = part.gameObject.layer;
-                if (h.GetComponent<Renderer>() is Renderer r)
-                    r.sharedMaterial = HandleMat(i == sel);   // ZTest Always -> visible through the hull
+                bool isSel = (i == sel);
+                // Node selectors (circles) and section glyphs always show; "active only" just limits the
+                // resize tips to the selected node.
+                bool showTips = isSel || !showActiveOnly;
+
+                float y = (nodes[i].position - 0.5f) * length;
+                float rH = Erh(nodes[i]), off = Eoff(nodes[i]);
+                Vector3 baseW = part.transform.TransformPoint(new Vector3(0f, y, off));   // node centre (incl. offset)
+
+                bool nodeHot = (i == hover && hoverKind == HoverKind.Node);
+                float s = (isSel || nodeHot) ? 0.30f : 0.22f;
+                Material nodeMat = nodeHot ? HandleMat(2) : (isSel ? HandleMat(0) : HandleMat(1));
+                // End nodes are drawn as arrows pointing fore/aft along the spine (they can't move
+                // forward/back); interior nodes are circles.
+                bool isLast = (i == nodes.Count - 1);
+                Mesh nodeMesh = IsEndNode(i) ? (_meshTriangle ??= BuildTriangle()) : (_meshCircle ??= BuildCircle());
+                Quaternion nodeRot = IsEndNode(i) ? SpineBillboard(cam, rot, isLast) : rot;
+                PlaceIcon(_nodeHandles[i], baseW, nodeRot, s, nodeMesh, nodeMat, true, cam);
+
+                bool profHot = (i == hover && hoverKind == HoverKind.Profile);
+                PlaceIcon(_profIcons[i], baseW + up * 0.32f, rot, profHot ? 0.22f : 0.16f,
+                          ProfileIconMesh(nodes[i].profile), profHot ? HandleMat(2) : ProfileMat, true, cam);
+
+                Vector3 lW = part.transform.TransformPoint(new Vector3(-rH, y, off));
+                Vector3 rW = part.transform.TransformPoint(new Vector3(rH, y, off));
+                bool lHot = (i == hover && hoverKind == HoverKind.TipLeft);
+                bool rHot = (i == hover && hoverKind == HoverKind.TipRight);
+                PlaceTip(_leftTips[i], lW, rot, showTips, lHot, cam);
+                PlaceTip(_rightTips[i], rW, rot, showTips, rHot, cam);
+            }
+
+            if (cam != null) HandleGizmoInput(cam, hoverKind, hover);
+            else SetInputLock(false);
+        }
+
+        private void SyncHandleCount(List<GameObject> list, string name)
+        {
+            while (list.Count < nodes.Count) list.Add(CreateHandle(name));
+            while (list.Count > nodes.Count)
+            {
+                GameObject extra = list[list.Count - 1];
+                list.RemoveAt(list.Count - 1);
+                if (extra != null) Destroy(extra);
             }
         }
 
-        private GameObject CreateHandle()
+        private void PlaceIcon(GameObject go, Vector3 worldPos, Quaternion rot, float scale, Mesh mesh, Material mat, bool outline, Camera cam)
         {
-            GameObject go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            go.name = "SpineNodeHandle";
-            if (go.GetComponent<Collider>() is Collider c) Destroy(c);
-            return go;
+            if (go == null) return;
+            go.transform.SetParent(null, false);
+            go.transform.position = worldPos;
+            go.transform.rotation = rot;                       // billboard
+            go.transform.localScale = Vector3.one * scale;
+            go.layer = part.gameObject.layer;
+            if (go.GetComponent<MeshFilter>() is MeshFilter mf) mf.sharedMesh = mesh;
+            if (go.GetComponent<Renderer>() is Renderer r) r.sharedMaterial = mat;
+            if (outline) PlaceOutline(go, mesh, scale, cam);
         }
 
-        private static Material _matSel, _matNorm;
-        private static Material HandleMat(bool selected) =>
-            selected ? (_matSel ??= MakeMat(Color.yellow)) : (_matNorm ??= MakeMat(new Color(0.2f, 0.8f, 1f)));
+        // A black copy of the icon, one outline-pixel larger, drawn first (lower render queue) so it
+        // shows as a thin outline behind the coloured icon. The child scale is solved each frame so the
+        // ring is a constant ~1 px wide regardless of zoom. Parented to the icon so it billboards with it.
+        private const float OutlinePixels = 1f;
+        private void PlaceOutline(GameObject go, Mesh mesh, float parentScale, Camera cam)
+        {
+            Transform ot = go.transform.Find("outline");
+            GameObject o = (ot != null) ? ot.gameObject : new GameObject("outline", typeof(MeshFilter), typeof(MeshRenderer));
+            o.transform.SetParent(go.transform, false);
+            o.transform.localPosition = Vector3.zero;
+            o.transform.localRotation = Quaternion.identity;
+            o.layer = go.layer;
+
+            float child = 1.1f;
+            if (cam != null)
+            {
+                Vector3 c = go.transform.position;
+                float pxPerWorld = Vector2.Distance(cam.WorldToScreenPoint(c), cam.WorldToScreenPoint(c + cam.transform.right));
+                float coloredR = 0.5f * parentScale;          // world radius of the coloured disc
+                if (pxPerWorld > 1e-4f && coloredR > 1e-5f)
+                    child = (coloredR + OutlinePixels / pxPerWorld) / coloredR;
+            }
+            o.transform.localScale = Vector3.one * child;
+            o.GetComponent<MeshFilter>().sharedMesh = mesh;
+            o.GetComponent<Renderer>().sharedMaterial = OutlineMat;
+        }
+
+        // A tip handle (diamond) at a section edge; shown only for the selected node.
+        private void PlaceTip(GameObject go, Vector3 worldPos, Quaternion rot, bool show, bool hot, Camera cam)
+        {
+            if (go == null) return;
+            if (go.activeSelf != show) go.SetActive(show);
+            if (!show) return;
+            PlaceIcon(go, worldPos, rot, hot ? 0.26f : 0.20f, _meshDiamond ??= BuildDiamond(),
+                      hot ? HandleMat(2) : TipMat, true, cam);
+        }
+
+        // Cursor-projected width and spine position from a tip-drag ray, in the section's width/length
+        // plane. Returns false if the ray misses the plane.
+        private bool RawTip(int i, Ray ray, out float rawW, out float rawP)
+        {
+            SpineNode n = nodes[i];
+            rawW = n.sizeH; rawP = n.position;
+            Vector3 center = part.transform.TransformPoint(new Vector3(0f, NodeY(n), Eoff(n)));
+            Plane plane = new Plane(part.transform.forward, center);   // local-Z normal -> the X/Y plane
+            if (!plane.Raycast(ray, out float enter)) return false;
+            Vector3 local = part.transform.InverseTransformPoint(ray.GetPoint(enter));
+            rawW = 2f * Mathf.Abs(local.x) / Mathf.Max(0.01f, hScale);
+            rawP = local.y / Mathf.Max(0.01f, length) + 0.5f;
+            return true;
+        }
+
+        // Drag a node's edge tip in the section's width/length plane: |x| sets the width, the spine (y)
+        // coordinate repositions the node (clamped between neighbours). Either move alone or together.
+        private void DragTip(int i, int side, Ray ray)
+        {
+            SpineNode n = nodes[i];
+            if (!RawTip(i, ray, out float rawW, out float rawP)) return;
+
+            float newH = Mathf.Clamp(rawW + _grabDeltaW, MinSize, MaxSize);
+            // End nodes are pinned fore/aft -> width only.
+            float pos = n.position;
+            if (!IsEndNode(i))
+            {
+                pos = rawP + _grabDeltaP;
+                float lo = (i > 0) ? nodes[i - 1].position + 0.01f : 0f;
+                float hi = (i < nodes.Count - 1) ? nodes[i + 1].position - 0.01f : 1f;
+                if (lo > hi) lo = hi = 0.5f * (lo + hi);
+                pos = Mathf.Clamp(pos, lo, hi);
+            }
+
+            if (Mathf.Approximately(newH, n.sizeH) && Mathf.Approximately(pos, n.position)) return;   // no change
+            n.sizeH = newH;
+            n.position = pos;
+            if (i == SelIndex) { nodeWidth = n.sizeH; nodePos = pos; }   // live slider update
+            RebuildLive();   // full sync deferred to drag end
+        }
+
+        private void HandleGizmoInput(Camera cam, HoverKind hoverKind, int hover)
+        {
+            if (_dragIndex >= 0)
+            {
+                if (Input.GetMouseButton(0))
+                {
+                    SetInputLock(true);
+                    DragNodeVertical(_dragIndex, cam.ScreenPointToRay(Input.mousePosition));
+                }
+                else
+                {
+                    _dragIndex = -1;
+                    RebuildAndPropagate();   // one full interop + symmetry sync on release
+                    nodeOffsetV = nodes[SelIndex].offsetV;
+                    MonoUtilities.RefreshPartContextWindow(part);
+                }
+                return;
+            }
+
+            if (_tipDragIndex >= 0)
+            {
+                if (Input.GetMouseButton(0))
+                {
+                    SetInputLock(true);
+                    DragTip(_tipDragIndex, _tipSide, cam.ScreenPointToRay(Input.mousePosition));
+                }
+                else
+                {
+                    _tipDragIndex = -1;
+                    RebuildAndPropagate();   // one full interop + symmetry sync on release
+                    SpineNode sn = nodes[SelIndex];
+                    nodeWidth = sn.sizeH;
+                    nodePos = sn.position;
+                    MonoUtilities.RefreshPartContextWindow(part);
+                }
+                return;
+            }
+
+            SetInputLock(hover >= 0);
+            if (hover < 0) return;
+
+            switch (hoverKind)
+            {
+                case HoverKind.Profile:
+                    if (Input.GetMouseButtonDown(0)) SelectNode(hover);
+                    else if (Input.GetMouseButtonDown(2)) CycleProfile(hover);
+                    return;
+
+                case HoverKind.TipLeft:
+                case HoverKind.TipRight:
+                    // Tip handle: drag out/in widens/narrows, drag along the spine repositions.
+                    if (Input.GetMouseButtonDown(0))
+                    {
+                        SelectNode(hover);
+                        _tipDragIndex = hover;
+                        _tipSide = (hoverKind == HoverKind.TipLeft) ? -1 : 1;
+                        // Capture the grab offset so the drag moves by the cursor delta, not snapping the
+                        // value to the (possibly off-tip) grab point.
+                        if (RawTip(hover, cam.ScreenPointToRay(Input.mousePosition), out float rw, out float rp))
+                        { _grabDeltaW = nodes[hover].sizeH - rw; _grabDeltaP = nodes[hover].position - rp; }
+                        else { _grabDeltaW = _grabDeltaP = 0f; }
+                    }
+                    return;
+
+                default:
+                    // Node circle. With "must select before dragging" on, the first click only selects
+                    // (so you can click a node without moving it) and only the already-selected node
+                    // drags; with it off, any node drags immediately. Drag = vertical offset, wheel = height.
+                    if (Input.GetMouseButtonDown(0))
+                    {
+                        bool canDrag = !requireSelectToDrag || hover == SelIndex;
+                        SelectNode(hover);
+                        if (canDrag)
+                        {
+                            _dragIndex = hover;
+                            _grabDeltaV = nodes[hover].offsetV - RawVertical(hover, cam.ScreenPointToRay(Input.mousePosition));
+                        }
+                    }
+                    else if (!Mathf.Approximately(Input.mouseScrollDelta.y, 0f)) ResizeNode(hover, Input.mouseScrollDelta.y);
+                    return;
+            }
+        }
+
+        // Nearest icon whose rendered disc the mouse is actually inside; the hit radius is the icon's
+        // own on-screen size (incl. outline) so the hotzone matches what you see. The kind tells the
+        // caller which control the mouse is over.
+        private int ComputeHover(Camera cam, out HoverKind kind)
+        {
+            Vector2 mouse = Input.mousePosition;
+            int hover = -1;
+            kind = HoverKind.None;
+            float best = float.MaxValue;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                if (i < _nodeHandles.Count && _nodeHandles[i] != null && _nodeHandles[i].activeInHierarchy)
+                {
+                    float d = ScreenDist(cam, _nodeHandles[i].transform.position, mouse);
+                    float rad = IconScreenRadius(cam, _nodeHandles[i]);
+                    if (d >= 0f && d <= rad && d < best) { best = d; hover = i; kind = HoverKind.Node; }
+                }
+                if (i < _profIcons.Count && _profIcons[i] != null && _profIcons[i].activeInHierarchy)
+                {
+                    float d = ScreenDist(cam, _profIcons[i].transform.position, mouse);
+                    float rad = IconScreenRadius(cam, _profIcons[i]);
+                    if (d >= 0f && d <= rad && d < best) { best = d; hover = i; kind = HoverKind.Profile; }
+                }
+                if (i < _leftTips.Count && _leftTips[i] != null && _leftTips[i].activeInHierarchy)
+                {
+                    float d = ScreenDist(cam, _leftTips[i].transform.position, mouse);
+                    float rad = IconScreenRadius(cam, _leftTips[i]);
+                    if (d >= 0f && d <= rad && d < best) { best = d; hover = i; kind = HoverKind.TipLeft; }
+                }
+                if (i < _rightTips.Count && _rightTips[i] != null && _rightTips[i].activeInHierarchy)
+                {
+                    float d = ScreenDist(cam, _rightTips[i].transform.position, mouse);
+                    float rad = IconScreenRadius(cam, _rightTips[i]);
+                    if (d >= 0f && d <= rad && d < best) { best = d; hover = i; kind = HoverKind.TipRight; }
+                }
+            }
+            return hover;
+        }
+
+        private static float ScreenDist(Camera cam, Vector3 world, Vector2 mouse)
+        {
+            Vector3 sp = cam.WorldToScreenPoint(world);
+            if (sp.z < 0f) return -1f;   // behind camera
+            return Vector2.Distance(new Vector2(sp.x, sp.y), mouse);
+        }
+
+        // On-screen pixel radius of an icon disc (mesh radius 0.5 * its outline scale 1.25), plus a few
+        // pixels of slack so the very edge is still grabbable.
+        private static float IconScreenRadius(Camera cam, GameObject go)
+        {
+            Vector3 c = go.transform.position;
+            Vector3 e = c + cam.transform.right * (0.5f * go.transform.localScale.x);
+            Vector3 sc = cam.WorldToScreenPoint(c);
+            Vector3 se = cam.WorldToScreenPoint(e);
+            return Vector2.Distance(new Vector2(sc.x, sc.y), new Vector2(se.x, se.y)) + 3f;
+        }
+
+        private void SelectNode(int i)
+        {
+            selectedNode = Mathf.Clamp(i, 0, nodes.Count - 1);
+            LoadProxyFromNode();
+            MonoUtilities.RefreshPartContextWindow(part);
+        }
+
+        private void CycleProfile(int i)
+        {
+            SpineNode n = nodes[i];
+            n.profile = (SpineProfile)(((int)n.profile + 1) % 4);   // Ellipse -> Rectangle -> Mk2 -> Mk3
+            RebuildAndPropagate();                                  // section type changes geometry
+            if (i == SelIndex) { LoadProxyFromNode(); MonoUtilities.RefreshPartContextWindow(part); }
+        }
+
+        // Mouse wheel on a node makes it taller / shorter (its vertical size).
+        private void ResizeNode(int i, float scroll)
+        {
+            SpineNode n = nodes[i];
+            float step = PPart.diameterSmallStep * Mathf.Sign(scroll);
+            n.sizeV = Mathf.Clamp(n.sizeV + step, MinSize, MaxSize);
+            RebuildAndPropagate();
+            if (i == SelIndex) { LoadProxyFromNode(); MonoUtilities.RefreshPartContextWindow(part); }
+        }
+
+        // Cursor-projected vertical offset (m, pre-vScale) from a drag ray along the part's local Z axis.
+        private float RawVertical(int i, Ray ray)
+        {
+            Vector3 axisPoint = part.transform.TransformPoint(new Vector3(0f, NodeY(nodes[i]), 0f));   // un-offset centre
+            float zWorld = ClosestParamOnAxis(axisPoint, part.transform.forward, ray);                 // metres along local Z
+            return (vScale > 0f) ? zWorld / vScale : zWorld;
+        }
+
+        // Dragging a node moves its cross-section up/down (vertical centre offset), tracking the mouse
+        // along the part's local vertical (Z) axis.
+        private void DragNodeVertical(int i, Ray ray)
+        {
+            SpineNode n = nodes[i];
+            float newOffset = Mathf.Clamp(RawVertical(i, ray) + _grabDeltaV, -10f, 10f);
+            if (Mathf.Approximately(newOffset, n.offsetV)) return;   // no change -> skip rebuild
+            n.offsetV = newOffset;
+            if (i == SelIndex) nodeOffsetV = newOffset;   // PAW value updates; refresh on drag end
+            RebuildLive();   // full sync deferred to drag end
+        }
+
+        // Parameter (signed metres along axisDir from axisPoint) of the point on the axis line closest
+        // to the mouse ray.
+        private static float ClosestParamOnAxis(Vector3 axisPoint, Vector3 axisDir, Ray ray)
+        {
+            Vector3 d1 = axisDir.normalized;
+            Vector3 d2 = ray.direction.normalized;
+            Vector3 r = axisPoint - ray.origin;
+            float b = Vector3.Dot(d1, d2);
+            float denom = 1f - b * b;            // a = d1.d1 = 1, e = d2.d2 = 1
+            if (denom < 1e-6f) return Vector3.Dot(d1, r);   // parallel
+            float c = Vector3.Dot(d1, r);
+            float f = Vector3.Dot(d2, r);
+            return (b * f - c) / denom;
+        }
+
+        private void SetInputLock(bool on)
+        {
+            if (on && !_inputLocked) { InputLockManager.SetControlLock(GizmoLockMask, GizmoLockId); _inputLocked = true; }
+            else if (!on && _inputLocked) { InputLockManager.RemoveControlLock(GizmoLockId); _inputLocked = false; }
+        }
+
+        private static Camera GizmoCam =>
+            (EditorCamera.Instance != null && EditorCamera.Instance.cam != null) ? EditorCamera.Instance.cam : Camera.main;
+
+        private GameObject CreateHandle(string name) => new GameObject(name, typeof(MeshFilter), typeof(MeshRenderer));
+
+        // Flat billboarded icon meshes (white vertex colours, tinted by the handle material).
+        private static Mesh _meshCircle;
+
+        // Section-type glyph drawn above the node circle: the cross-section's own silhouette so it
+        // reads at a glance (ellipse squished, Mk3 round, rectangle square, Mk2 lifting-body).
+        private static Mesh _iconEllipse, _iconRect, _iconMk2, _iconMk3;
+        private static Mesh ProfileIconMesh(SpineProfile p)
+        {
+            switch (p)
+            {
+                case SpineProfile.Rectangle: return _iconRect ??= FanMesh(UnitRect, "Rect", new Vector2(1f, 0.6f));
+                case SpineProfile.Mk2: return _iconMk2 ??= FanMesh(UnitMk2, "Mk2", new Vector2(1f, 0.6f));
+                case SpineProfile.Mk3: return _iconMk3 ??= FanMesh(BuildMk3Outline(0.43f, 0.5f), "Mk3", Vector2.one);
+                default: return _iconEllipse ??= FanMesh(UnitCircle, "Ellipse", new Vector2(1f, 0.62f));
+            }
+        }
+
+        private static Mesh BuildCircle() => FanMesh(UnitCircle, "Circle", Vector2.one);
+
+        private static Mesh _meshDiamond;
+        private static Mesh BuildDiamond() => FanMesh(new[] { new Vector2(1f, 0f), new Vector2(0f, 1f), new Vector2(-1f, 0f), new Vector2(0f, -1f) }, "Diamond", Vector2.one);
+
+        // Triangle pointing +Y (oriented along the spine by SpineBillboard for the end nodes).
+        private static Mesh _meshTriangle;
+        private static Mesh BuildTriangle()
+        {
+            var v = new[] { new Vector3(0f, 0.62f, 0f), new Vector3(-0.54f, -0.42f, 0f), new Vector3(0.54f, -0.42f, 0f) };
+            var col = new[] { Color.white, Color.white, Color.white };
+            var tris = new[] { 0, 1, 2, 0, 2, 1 };   // double-sided
+            return new Mesh { name = "SpineTriangle", vertices = v, colors = col, triangles = tris };
+        }
+
+        // Billboard that keeps the glyph facing the camera but points its +Y along the spine (fore/aft).
+        private Quaternion SpineBillboard(Camera cam, Quaternion fallback, bool front)
+        {
+            if (cam == null) return fallback;
+            Vector3 spine = part.transform.up;                  // world dir toward the top node
+            Vector3 dir = front ? spine : -spine;
+            Vector3 fwd = cam.transform.forward;
+            Vector3 proj = dir - Vector3.Dot(dir, fwd) * fwd;   // onto the camera plane
+            if (proj.sqrMagnitude < 1e-6f) return fallback;     // looking straight down the axis
+            return Quaternion.LookRotation(fwd, proj.normalized);
+        }
+
+        // Filled convex polygon (triangle fan from the centre) of a unit outline, fit into the icon box.
+        private static Mesh FanMesh(Vector2[] outline, string name, Vector2 scale)
+        {
+            int n = outline.Length;
+            var v = new Vector3[n + 1];
+            var col = new Color[n + 1];
+            v[0] = Vector3.zero; col[0] = Color.white;
+            for (int i = 0; i < n; i++)
+            {
+                v[i + 1] = new Vector3(outline[i].x * scale.x * 0.5f, outline[i].y * scale.y * 0.5f, 0f);
+                col[i + 1] = Color.white;
+            }
+            var tris = new int[n * 3];
+            for (int i = 0; i < n; i++) { tris[i * 3] = 0; tris[i * 3 + 1] = 1 + i; tris[i * 3 + 2] = 1 + (i + 1) % n; }
+            return new Mesh { name = "SpineProf" + name, vertices = v, colors = col, triangles = tris };
+        }
+
+        private static Material _matSel, _matNorm, _matHover, _matProf;
+        // 0 = selected (yellow), 1 = normal (cyan), 2 = hovered (white).
+        private static Material HandleMat(int kind)
+        {
+            switch (kind)
+            {
+                case 0: return _matSel ??= MakeMat(Color.yellow);
+                case 2: return _matHover ??= MakeMat(Color.white);
+                default: return _matNorm ??= MakeMat(new Color(0.2f, 0.8f, 1f));
+            }
+        }
+
+        // Section glyph idle tint (green), so it reads as a distinct control from the node circle.
+        private static Material ProfileMat => _matProf ??= MakeMat(new Color(0.5f, 1f, 0.55f));
+
+        // Edge tip handle idle tint (orange).
+        private static Material _matTip;
+        private static Material TipMat => _matTip ??= MakeMat(new Color(1f, 0.6f, 0.15f));
+
+        // Black outline drawn one queue earlier (behind) the coloured icons so they stand out.
+        private static Material _matOutline;
+        private static Material OutlineMat
+        {
+            get { if (_matOutline == null) { _matOutline = MakeMat(Color.black); _matOutline.renderQueue = 4999; } return _matOutline; }
+        }
 
         // Unlit, solid, always-on-top material (renders through the mesh).
         private static Material MakeMat(Color col)
@@ -639,14 +1484,25 @@ namespace ProceduralParts
             return m;
         }
 
-        private void DestroyHandles()
+        private void CleanupGizmo()
         {
-            foreach (GameObject h in _handles) if (h != null) Destroy(h);
-            _handles.Clear();
+            _dragIndex = -1;
+            _tipDragIndex = -1;
+            SetInputLock(false);
+            DestroyAll(_nodeHandles);
+            DestroyAll(_profIcons);
+            DestroyAll(_leftTips);
+            DestroyAll(_rightTips);
         }
 
-        public void OnDisable() => DestroyHandles();
-        public void OnDestroy() => DestroyHandles();
+        private void DestroyAll(List<GameObject> list)
+        {
+            foreach (GameObject h in list) if (h != null) Destroy(h);
+            list.Clear();
+        }
+
+        public void OnDisable() => CleanupGizmo();
+        public void OnDestroy() => CleanupGizmo();
 
         #endregion
 
@@ -663,8 +1519,32 @@ namespace ProceduralParts
         private void GenerateSideMesh(List<Ring> rings)
         {
             int rc = rings.Count;
-            int per = Sides + 1;                 // +1 wrap vertex for a clean UV seam
-            var mesh = new UncheckedMesh(rc * per, (rc - 1) * Sides * 2);
+
+            // Hard-edge columns: outline indices where the section turns sharply (Rectangle/Mk2
+            // corners). Detected globally (union over rings) so the loft topology stays a clean
+            // grid; a corner that rounds out along a profile morph keeps its column but the two
+            // duplicated normals converge, so the crease fades smoothly into the rounded section
+            // instead of cutting across it.
+            bool[] hard = ComputeHardColumns(rings);
+
+            // Expand each ring into columns, duplicating every hard column so the two flats it
+            // joins carry their own one-sided normals -> a crisp lighting break at the corner.
+            var cols = new List<int>();    // original outline index of each emitted column
+            var side = new List<int>();    // -1 = left copy, +1 = right copy, 0 = smooth/centred
+            for (int j = 0; j < Sides; j++)
+            {
+                if (hard[j]) { cols.Add(j); side.Add(-1); cols.Add(j); side.Add(+1); }
+                else { cols.Add(j); side.Add(0); }
+            }
+            int K = cols.Count;
+            int per = K + 1;                 // +1 wrap column for a clean UV seam
+
+            // A shell also gets an inner skin: the same vertices with flipped normals and reversed
+            // winding, so the interior renders and lights correctly (useful for shrouds/shields).
+            int vCount = shellMode ? 2 * rc * per : rc * per;
+            int triCount = shellMode ? 2 * (rc - 1) * K * 2 : (rc - 1) * K * 2;
+            int innerBase = rc * per;
+            var mesh = new UncheckedMesh(vCount, triCount);
 
             float span = rings[rc - 1].y - rings[0].y;
             if (span <= 0f) span = 1f;
@@ -675,51 +1555,111 @@ namespace ProceduralParts
                 Ring below = rings[Mathf.Max(0, r - 1)];
                 Ring above = rings[Mathf.Min(rc - 1, r + 1)];
                 Ring ring = rings[r];
-                for (int j = 0; j <= Sides; j++)
+                float[] arcFrac = RingArcFractions(ring);   // cumulative perimeter fraction -> even texel density
+                for (int k = 0; k <= K; k++)
                 {
-                    float ang = 2f * Mathf.PI * j / Sides;
-                    float c = Mathf.Cos(ang), s = Mathf.Sin(ang);
-                    int idx = r * per + j;
-                    mesh.vertices[idx] = new Vector3(c * ring.rH, ring.y, s * ring.rV);
+                    int c = k % K;
+                    int j = cols[c];
+                    int sd = side[c];
+                    int idx = r * per + k;
+                    Vector3 pos = RingV(ring, j);
+                    mesh.vertices[idx] = pos;
 
-                    Vector3 pAbove = new Vector3(c * above.rH, above.y, s * above.rV);
-                    Vector3 pBelow = new Vector3(c * below.rH, below.y, s * below.rV);
-                    Vector3 tSpine = pAbove - pBelow;
-                    Vector3 tRing = new Vector3(-s * ring.rH, 0f, c * ring.rV);
+                    Vector3 tSpine = RingV(above, j) - RingV(below, j);
+                    // One-sided ring tangent on a hard column gives each flat its own face normal;
+                    // the centred difference keeps curved sections smooth.
+                    Vector3 tRing = (sd < 0) ? RingV(ring, j) - RingV(ring, j - 1)
+                                  : (sd > 0) ? RingV(ring, j + 1) - RingV(ring, j)
+                                             : RingV(ring, j + 1) - RingV(ring, j - 1);
                     Vector3 normal = Vector3.Cross(tSpine, tRing).normalized;
-                    Vector3 radial = new Vector3(c * ring.rV, 0f, s * ring.rH);
+                    Vector3 radial = new Vector3(pos.x, 0f, pos.z - ring.offsetZ);   // from the ring centre
                     if (Vector3.Dot(normal, radial) < 0f) normal = -normal;
-                    if (normal == Vector3.zero) normal = radial.normalized;
+                    if (normal == Vector3.zero) normal = (radial.sqrMagnitude > 0f) ? radial.normalized : Vector3.right;
                     mesh.normals[idx] = normal;
-                    Vector3 tan = tRing.normalized;
+                    Vector3 tan = (tRing.sqrMagnitude > 0f) ? tRing.normalized : Vector3.right;
                     mesh.tangents[idx] = new Vector4(tan.x, tan.y, tan.z, 1f);
-                    mesh.uv[idx] = new Vector2((float)j / Sides, vCoord);
+                    mesh.uv[idx] = new Vector2((k == K) ? 1f : arcFrac[j], vCoord);
+
+                    if (shellMode)   // inner skin: same point, flipped normal
+                    {
+                        int iidx = innerBase + idx;
+                        mesh.vertices[iidx] = pos;
+                        mesh.normals[iidx] = -normal;
+                        mesh.tangents[iidx] = new Vector4(-tan.x, -tan.y, -tan.z, 1f);
+                        mesh.uv[iidx] = mesh.uv[idx];
+                    }
                 }
             }
 
             int t = 0;
             for (int r = 0; r < rc - 1; r++)
             {
-                for (int j = 0; j < Sides; j++)
+                for (int k = 0; k < K; k++)
                 {
-                    int a = r * per + j;
-                    int b = r * per + j + 1;
-                    int cc = (r + 1) * per + j;
-                    int d = (r + 1) * per + j + 1;
+                    int a = r * per + k;
+                    int b = r * per + k + 1;
+                    int cc = (r + 1) * per + k;
+                    int d = (r + 1) * per + k + 1;
                     mesh.triangles[t++] = a; mesh.triangles[t++] = cc; mesh.triangles[t++] = b;
                     mesh.triangles[t++] = b; mesh.triangles[t++] = cc; mesh.triangles[t++] = d;
+                    if (shellMode)   // inner skin: reversed winding
+                    {
+                        int ia = innerBase + a, ib = innerBase + b, ic = innerBase + cc, id = innerBase + d;
+                        mesh.triangles[t++] = ia; mesh.triangles[t++] = ib; mesh.triangles[t++] = ic;
+                        mesh.triangles[t++] = ib; mesh.triangles[t++] = id; mesh.triangles[t++] = ic;
+                    }
                 }
             }
 
             float avgCirc = 0f;
-            foreach (Ring r in rings) avgCirc += EllipsePerimeter(r.rH, r.rV);
+            foreach (Ring r in rings) avgCirc += OutlinePerimeter(r.outline);
             avgCirc /= rc;
             RaiseChangeTextureScale("sides", PPart.legacyTextureHandler.SidesMaterial, new Vector2(avgCirc, length));
             WriteToAppropriateMesh(mesh, PPart.SidesIconMesh, SidesMesh);
         }
 
+        // Cumulative perimeter fraction at each outline index (length Sides+1, [0]=0 .. [Sides]=1), so the
+        // side texture U maps by arc length -> uniform texel density on flats and curves alike.
+        private static float[] RingArcFractions(Ring ring)
+        {
+            Vector2[] o = ring.outline;
+            int n = o.Length;
+            var cum = new float[n + 1];
+            for (int j = 0; j < n; j++) cum[j + 1] = cum[j] + (o[(j + 1) % n] - o[j]).magnitude;
+            float total = (cum[n] > 1e-6f) ? cum[n] : 1f;
+            for (int j = 0; j <= n; j++) cum[j] /= total;
+            return cum;
+        }
+
+        // A column is "hard" if the outline turns sharply there in any ring (a Rectangle/Mk2
+        // corner). Curved profiles (~15 deg/step at Sides=24) stay under the threshold and remain
+        // smoothly shaded.
+        private static bool[] ComputeHardColumns(List<Ring> rings)
+        {
+            const float thresholdDeg = 30f;
+            var hard = new bool[Sides];
+            foreach (Ring ring in rings)
+            {
+                for (int j = 0; j < Sides; j++)
+                {
+                    if (hard[j]) continue;
+                    Vector3 a = RingV(ring, j) - RingV(ring, j - 1);
+                    Vector3 b = RingV(ring, j + 1) - RingV(ring, j);
+                    Vector2 a2 = new Vector2(a.x, a.z), b2 = new Vector2(b.x, b.z);
+                    if (a2.sqrMagnitude < 1e-10f || b2.sqrMagnitude < 1e-10f) continue;
+                    if (Vector2.Angle(a2, b2) > thresholdDeg) hard[j] = true;
+                }
+            }
+            return hard;
+        }
+
         private void GenerateCapMesh(List<Ring> rings)
         {
+            if (shellMode)   // open ends -> no caps
+            {
+                WriteToAppropriateMesh(new UncheckedMesh(0, 0), PPart.EndsIconMesh, EndsMesh);
+                return;
+            }
             var mesh = new UncheckedMesh(Sides * 2, (Sides - 2) * 2);
             WriteCapVertices(mesh, rings[0], 0, false);
             WriteCapVertices(mesh, rings[rings.Count - 1], Sides, true);
@@ -733,10 +1673,8 @@ namespace ProceduralParts
             float denom = Mathf.Max(0.01f, 2f * Mathf.Max(ring.rH, ring.rV));
             for (int j = 0; j < Sides; j++)
             {
-                float ang = 2f * Mathf.PI * j / Sides;
-                float c = Mathf.Cos(ang), s = Mathf.Sin(ang);
                 int idx = offset + j;
-                Vector3 pos = new Vector3(c * ring.rH, ring.y, s * ring.rV);
+                Vector3 pos = RingV(ring, j);
                 mesh.vertices[idx] = pos;
                 mesh.normals[idx] = new Vector3(0f, up ? 1f : -1f, 0f);
                 mesh.tangents[idx] = new Vector4(1f, 0f, 0f, 1f);
@@ -760,17 +1698,15 @@ namespace ProceduralParts
             int rc = rings.Count;
             int per = ColliderSides;
             int sideTris = (rc - 1) * ColliderSides * 2;
-            int capTris = (ColliderSides - 2) * 2;
+            int capTris = shellMode ? 0 : (ColliderSides - 2) * 2;   // open ends in shell mode
             var mesh = new UncheckedMesh(rc * per, sideTris + capTris);
 
+            int stride = Mathf.Max(1, Sides / ColliderSides);
             for (int r = 0; r < rc; r++)
             {
                 Ring ring = rings[r];
                 for (int j = 0; j < ColliderSides; j++)
-                {
-                    float ang = 2f * Mathf.PI * j / ColliderSides;
-                    mesh.vertices[r * per + j] = new Vector3(Mathf.Cos(ang) * ring.rH, ring.y, Mathf.Sin(ang) * ring.rV);
-                }
+                    mesh.vertices[r * per + j] = RingV(ring, j * stride);
             }
 
             int t = 0;
@@ -786,14 +1722,17 @@ namespace ProceduralParts
                     mesh.triangles[t++] = b; mesh.triangles[t++] = c; mesh.triangles[t++] = d;
                 }
             }
-            int botOff = 0, topOff = (rc - 1) * per;
-            for (int i = 0; i < ColliderSides - 2; i++)
+            if (!shellMode)
             {
-                mesh.triangles[t++] = botOff; mesh.triangles[t++] = botOff + i + 1; mesh.triangles[t++] = botOff + i + 2;
-            }
-            for (int i = 0; i < ColliderSides - 2; i++)
-            {
-                mesh.triangles[t++] = topOff; mesh.triangles[t++] = topOff + i + 2; mesh.triangles[t++] = topOff + i + 1;
+                int botOff = 0, topOff = (rc - 1) * per;
+                for (int i = 0; i < ColliderSides - 2; i++)
+                {
+                    mesh.triangles[t++] = botOff; mesh.triangles[t++] = botOff + i + 1; mesh.triangles[t++] = botOff + i + 2;
+                }
+                for (int i = 0; i < ColliderSides - 2; i++)
+                {
+                    mesh.triangles[t++] = topOff; mesh.triangles[t++] = topOff + i + 2; mesh.triangles[t++] = topOff + i + 1;
+                }
             }
 
             var colliderMesh = new Mesh();
@@ -811,10 +1750,11 @@ namespace ProceduralParts
             RaiseChangeTextureScale(nodeName, PPart.legacyTextureHandler.EndsMaterial, new Vector2(diameter, diameter));
         }
 
-        private static float EllipsePerimeter(float a, float b)
+        private static float OutlinePerimeter(Vector2[] o)
         {
-            // Ramanujan approximation.
-            return Mathf.PI * (3f * (a + b) - Mathf.Sqrt((3f * a + b) * (a + 3f * b)));
+            float p = 0f;
+            for (int j = 0; j < o.Length; j++) p += (o[(j + 1) % o.Length] - o[j]).magnitude;
+            return p;
         }
 
         #endregion

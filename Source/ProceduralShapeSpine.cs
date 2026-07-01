@@ -23,6 +23,9 @@ namespace ProceduralParts
         [Persistent] public float sizeH = 1.25f;     // horizontal diameter (m), before hScale
         [Persistent] public float sizeV = 1.25f;     // vertical diameter (m), before vScale
         [Persistent] public float offsetV = 0f;      // vertical centre offset (m), before vScale
+        [Persistent] public float offsetH = 0f;      // horizontal centre offset (m), before hScale
+        [Persistent] public float tiltV = 0f;        // vertical tilt (deg): +ve pitches the top of the ring forward (+spine)
+        [Persistent] public float tiltH = 0f;        // horizontal tilt (deg): +ve yaws the right of the ring forward (+spine)
         [Persistent] public float filletTop = 0f;    // top corner rounding, 0..1 of the half-min-extent
         [Persistent] public float filletBottom = 0f; // bottom corner rounding, 0..1
         [Persistent] public SpineProfile profile = SpineProfile.Ellipse;
@@ -34,8 +37,8 @@ namespace ProceduralParts
         public void Save(ConfigNode node) => ConfigNode.CreateConfigFromObject(this, node);
         public SpineNode Clone() => new SpineNode
         {
-            position = position, sizeH = sizeH, sizeV = sizeV, offsetV = offsetV,
-            filletTop = filletTop, filletBottom = filletBottom,
+            position = position, sizeH = sizeH, sizeV = sizeV, offsetV = offsetV, offsetH = offsetH,
+            tiltV = tiltV, tiltH = tiltH, filletTop = filletTop, filletBottom = filletBottom,
             profile = profile, slopeAbove = slopeAbove,
         };
     }
@@ -76,7 +79,12 @@ namespace ProceduralParts
         [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Hollow shell", groupName = ProceduralPart.PAWGroupName),
             UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
         public bool shellMode = false;
-        private const float ShellThickness = 0.02f;   // notional wall thickness for the shell's material volume
+
+        // Wall thickness (m) of the hollow shell: the inner skin is inset from the outer by this, and the
+        // open ends get a rim so the wall reads solid instead of paper-thin. Shown only in shell mode.
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Shell thickness", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0.005f, maxValue = 1.0f, incrementLarge = 0.1f, incrementSmall = 0.02f, incrementSlide = SliderPrecision, sigFigs = 3, unit = "m", useSI = true, affectSymCounterparts = UI_Scene.None)]
+        public float shellThickness = 0.05f;
 
         // Gizmo behaviour toggles (editor-only prefs). showActiveOnly limits the resize tips to the
         // selected node (selectors + section glyphs always show).
@@ -110,6 +118,16 @@ namespace ProceduralParts
             UI_FloatEdit(scene = UI_Scene.Editor, incrementSlide = SliderPrecision, sigFigs = 4, unit = "m", useSI = true, affectSymCounterparts = UI_Scene.None)]
         public float nodeHeight = 1.25f;
 
+        // Tilt the ring's plane: vertical tilt rakes the top of the section fore/aft, horizontal tilt rakes
+        // the right side fore/aft (a shear along the spine, not editable from the gizmo).
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node vertical tilt", guiFormat = "F1", guiUnits = "°", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = -60f, maxValue = 60f, incrementLarge = 15f, incrementSmall = 5f, incrementSlide = 0.1f, sigFigs = 1, affectSymCounterparts = UI_Scene.None)]
+        public float nodeTiltV = 0f;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node horizontal tilt", guiFormat = "F1", guiUnits = "°", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = -60f, maxValue = 60f, incrementLarge = 15f, incrementSmall = 5f, incrementSlide = 0.1f, sigFigs = 1, affectSymCounterparts = UI_Scene.None)]
+        public float nodeTiltH = 0f;
+
         [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node position", guiFormat = "F3", groupName = ProceduralPart.PAWGroupName),
             UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0f, maxValue = 1f, incrementLarge = 0.25f, incrementSmall = 0.05f, incrementSlide = SliderPrecision, sigFigs = 3, affectSymCounterparts = UI_Scene.None)]
         public float nodePos = 0.5f;
@@ -125,6 +143,10 @@ namespace ProceduralParts
         [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node height offset", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
             UI_FloatEdit(scene = UI_Scene.Editor, minValue = -10f, maxValue = 10f, incrementLarge = 0.5f, incrementSmall = 0.1f, incrementSlide = SliderPrecision, sigFigs = 3, unit = "m", affectSymCounterparts = UI_Scene.None)]
         public float nodeOffsetV = 0f;
+
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Node width offset", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatEdit(scene = UI_Scene.Editor, minValue = -10f, maxValue = 10f, incrementLarge = 0.5f, incrementSmall = 0.1f, incrementSlide = SliderPrecision, sigFigs = 3, unit = "m", affectSymCounterparts = UI_Scene.None)]
+        public float nodeOffsetH = 0f;
 
         // Rectangle: independent top/bottom corner rounding (0 = sharp). Shown only for Rectangle.
         [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Top fillet", guiFormat = "F2", groupName = ProceduralPart.PAWGroupName),
@@ -192,10 +214,12 @@ namespace ProceduralParts
         {
             get
             {
-                var sb = new StringBuilder("PP-Spine|").Append(length).Append('|').Append(hScale).Append('|').Append(vScale);
+                var sb = new StringBuilder("PP-Spine|").Append(length).Append('|').Append(hScale).Append('|').Append(vScale)
+                    .Append('|').Append(shellMode ? 1 : 0).Append(',').Append(shellThickness);
                 foreach (SpineNode n in nodes)
                     sb.Append('|').Append(n.position).Append(',').Append(n.sizeH).Append(',').Append(n.sizeV)
-                      .Append(',').Append(n.offsetV).Append(',').Append(n.filletTop).Append(',').Append(n.filletBottom)
+                      .Append(',').Append(n.offsetV).Append(',').Append(n.offsetH).Append(',').Append(n.tiltV).Append(',').Append(n.tiltH)
+                      .Append(',').Append(n.filletTop).Append(',').Append(n.filletBottom)
                       .Append(',').Append((int)n.profile).Append(',').Append((int)n.slopeAbove);
                 return sb.ToString();
             }
@@ -289,12 +313,18 @@ namespace ProceduralParts
                 profOpt.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeWidth)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeHeight)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeTiltV)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeTiltH)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodePos)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeOffsetV)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeOffsetH)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeFilletTop)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeFilletBottom)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(airfoil)].uiControlEditor.onFieldChanged = (f, o) => OnAirfoilChanged();
-                Fields[nameof(shellMode)].uiControlEditor.onFieldChanged = (f, o) => RebuildAndPropagate();
+                Fields[nameof(shellMode)].uiControlEditor.onFieldChanged = (f, o) => { UpdateShellVisibility(); RebuildAndPropagate(); };
+                Fields[nameof(shellThickness)].uiControlEditor.onFieldChanged = (f, o) => RebuildAndPropagate();
+
+                UpdateShellVisibility();
 
                 RefreshSelector();
                 LoadProxyFromNode();
@@ -392,16 +422,20 @@ namespace ProceduralParts
             }
         }
 
-        // A loft ring: position + half-extents (for diameter) + vertical centre offset + the precomputed
+        // A loft ring: position + half-extents (for diameter) + centre offsets + tilt (the ring plane is
+        // sheared along the spine by tan(tilt) per unit of in-plane coordinate) + the precomputed
         // Sides-point boundary outline (profile morph already applied).
-        private struct Ring { public float y, rH, rV, offsetZ; public Vector2[] outline; }
+        private struct Ring { public float y, rH, rV, offsetZ, offsetX, tanTiltV, tanTiltH; public Vector2[] outline; }
 
-        // 3D vertex of ring outline point j (index wraps), at the ring's y, shifted by its vertical offset.
+        // 3D vertex of ring outline point j (index wraps): outline (x=width, y=height) placed at the ring's
+        // y and shifted by its centre offsets, with the plane sheared along the spine by the tilts (top/right
+        // of the section move fore/aft). Tilt uses the point's in-plane coords so it pivots about the centre.
         private static Vector3 RingV(Ring ring, int j)
         {
             int n = ring.outline.Length;
             Vector2 p = ring.outline[((j % n) + n) % n];
-            return new Vector3(p.x, ring.y, p.y + ring.offsetZ);
+            float y = ring.y + p.y * ring.tanTiltV + p.x * ring.tanTiltH;
+            return new Vector3(p.x + ring.offsetX, y, p.y + ring.offsetZ);
         }
 
         // Sides-point outline of a ring, morphing profile pa->pb by blend, scaled to rH x rV, with the
@@ -604,6 +638,44 @@ namespace ProceduralParts
             return (Mathf.Abs(t1.y) >= Mathf.Abs(t2.y)) ? t1 : t2;
         }
 
+        // Inset a (CCW) outline inward by `t` metres along the local inward normal -- the shell's inner
+        // wall. Interior is to the LEFT of edge travel for a CCW polygon, so an edge (dx,dy)'s inward
+        // normal is (-dy,dx); a vertex uses the averaged normal of its two edges. Averaging undershoots
+        // slightly at corners (fine for a wall). Caller clamps `t` so a thick wall can't invert a small ring.
+        private static Vector2[] InsetOutline(Vector2[] o, float t)
+        {
+            int n = o.Length;
+            var res = new Vector2[n];
+            for (int j = 0; j < n; j++)
+            {
+                Vector2 prev = o[(j - 1 + n) % n], cur = o[j], next = o[(j + 1) % n];
+                Vector2 e1 = cur - prev, e2 = next - cur;
+                Vector2 in1 = new Vector2(-e1.y, e1.x); if (in1.sqrMagnitude > 1e-12f) in1.Normalize();
+                Vector2 in2 = new Vector2(-e2.y, e2.x); if (in2.sqrMagnitude > 1e-12f) in2.Normalize();
+                Vector2 inward = in1 + in2;
+                inward = (inward.sqrMagnitude > 1e-12f) ? inward.normalized : in2;
+                res[j] = cur + inward * t;
+            }
+            return res;
+        }
+
+        // A ring's inner wall: same placement (y / offsets / tilt), outline inset by the shell thickness,
+        // clamped so a thick wall on a small section can't collapse or invert the hole.
+        private Ring InnerRing(Ring outer)
+        {
+            float t = Mathf.Min(shellThickness, 0.45f * Mathf.Min(outer.rH, outer.rV));
+            Ring inner = outer;                       // struct copy carries y/offsets/tilt
+            inner.outline = InsetOutline(outer.outline, t);
+            return inner;
+        }
+
+        private List<Ring> BuildInnerRings(List<Ring> rings)
+        {
+            var inner = new List<Ring>(rings.Count);
+            foreach (Ring r in rings) inner.Add(InnerRing(r));
+            return inner;
+        }
+
         // Polygon area of a ring's outline (shoelace), used for an accurate volume of any profile.
         private static float RingArea(Ring ring)
         {
@@ -638,6 +710,8 @@ namespace ProceduralParts
         private float Erh(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeH * hScale, 0.05f, 100f);
         private float Erv(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeV * vScale, 0.05f, 100f);
         private float Eoff(SpineNode n) => Mathf.Clamp(n.offsetV * vScale, -100f, 100f);
+        private float EoffH(SpineNode n) => Mathf.Clamp(n.offsetH * hScale, -100f, 100f);
+        private static float TiltTan(float deg) => Mathf.Tan(Mathf.Deg2Rad * Mathf.Clamp(deg, -85f, 85f));
         private float NodeY(SpineNode n) => (n.position - 0.5f) * length;
 
         private Ring NodeRing(SpineNode n)
@@ -645,7 +719,8 @@ namespace ProceduralParts
             float rH = Erh(n), rV = Erv(n);
             return new Ring
             {
-                y = NodeY(n), rH = rH, rV = rV, offsetZ = Eoff(n),
+                y = NodeY(n), rH = rH, rV = rV, offsetZ = Eoff(n), offsetX = EoffH(n),
+                tanTiltV = TiltTan(n.tiltV), tanTiltH = TiltTan(n.tiltH),
                 outline = RingOutline(n.profile, n.profile, 0f, rH, rV, n.filletTop, n.filletBottom, n.filletTop, n.filletBottom),
             };
         }
@@ -663,6 +738,8 @@ namespace ProceduralParts
                 SpineNode lo = nodes[i - 1], hi = nodes[i];
                 float aY = NodeY(lo), bY = NodeY(hi), aH = Erh(lo), aV = Erv(lo), bH = Erh(hi), bV = Erv(hi);
                 float aOff = Eoff(lo), bOff = Eoff(hi);
+                float aOffX = EoffH(lo), bOffX = EoffH(hi);
+                float aTv = lo.tiltV, bTv = hi.tiltV, aTh = lo.tiltH, bTh = hi.tiltH;
                 SpineSlope slope = lo.slopeAbove;
                 // Fillets only change the outline for Rectangle, so a fillet difference only forces
                 // subdivision when both ends are rectangles (Mk2/Mk3/Ellipse ignore the fillet values).
@@ -683,6 +760,9 @@ namespace ProceduralParts
                         rH = rH,
                         rV = rV,
                         offsetZ = Mathf.Lerp(aOff, bOff, h),
+                        offsetX = Mathf.Lerp(aOffX, bOffX, h),
+                        tanTiltV = TiltTan(Mathf.Lerp(aTv, bTv, h)),
+                        tanTiltH = TiltTan(Mathf.Lerp(aTh, bTh, h)),
                         outline = RingOutline(lo.profile, hi.profile, t, rH, rV,
                                               lo.filletTop, lo.filletBottom, hi.filletTop, hi.filletBottom),
                     });
@@ -766,7 +846,7 @@ namespace ProceduralParts
         // stay self-consistent in either mode. Subdivided rings keep it tight.
         private float CalculateVolume(List<Ring> rings)
         {
-            if (shellMode) return LateralArea(rings) * ShellThickness;
+            if (shellMode) return LateralArea(rings) * shellThickness;
             float v = 0f;
             float prevArea = RingArea(rings[0]);
             for (int i = 1; i < rings.Count; i++)
@@ -848,7 +928,10 @@ namespace ProceduralParts
             nodePos = n.position;
             nodeWidth = n.sizeH;
             nodeHeight = n.sizeV;
+            nodeTiltV = n.tiltV;
+            nodeTiltH = n.tiltH;
             nodeOffsetV = n.offsetV;
+            nodeOffsetH = n.offsetH;
             nodeFilletTop = n.filletTop;
             nodeFilletBottom = n.filletBottom;
             Fields[nameof(nodePos)].guiActiveEditor = !IsEndNode(SelIndex);   // end nodes are pinned fore/aft
@@ -863,6 +946,9 @@ namespace ProceduralParts
             Fields[nameof(nodeFilletTop)].guiActiveEditor = rect;
             Fields[nameof(nodeFilletBottom)].guiActiveEditor = rect;
         }
+
+        // The shell-thickness slider only matters when the hollow shell is on.
+        private void UpdateShellVisibility() => Fields[nameof(shellThickness)].guiActiveEditor = shellMode;
 
         // At each end of the spine only the inward insert makes sense: the top node (highest position /
         // last index) hides "in front", the bottom node (index 0) hides "behind". The end nodes are also
@@ -905,7 +991,10 @@ namespace ProceduralParts
                     case nameof(nodeSlopeOpt): n.slopeAbove = ParseEnum(nodeSlopeOpt, SpineSlope.Linear); break;
                     case nameof(nodeWidth): n.sizeH = nodeWidth = Mathf.Clamp(nodeWidth, MinSize, MaxSize); break;
                     case nameof(nodeHeight): n.sizeV = nodeHeight = Mathf.Clamp(nodeHeight, MinSize, MaxSize); break;
+                    case nameof(nodeTiltV): n.tiltV = nodeTiltV = Mathf.Clamp(nodeTiltV, -60f, 60f); break;
+                    case nameof(nodeTiltH): n.tiltH = nodeTiltH = Mathf.Clamp(nodeTiltH, -60f, 60f); break;
                     case nameof(nodeOffsetV): n.offsetV = nodeOffsetV = Mathf.Clamp(nodeOffsetV, -10f, 10f); break;
+                    case nameof(nodeOffsetH): n.offsetH = nodeOffsetH = Mathf.Clamp(nodeOffsetH, -10f, 10f); break;
                     case nameof(nodeFilletTop): n.filletTop = nodeFilletTop = Mathf.Clamp01(nodeFilletTop); break;
                     case nameof(nodeFilletBottom): n.filletBottom = nodeFilletBottom = Mathf.Clamp01(nodeFilletBottom); break;
                     case nameof(nodeProfileOpt):
@@ -938,7 +1027,7 @@ namespace ProceduralParts
             }
         }
 
-        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} off={n.offsetV:F3} fil={n.filletTop:F2}/{n.filletBottom:F2} prof={n.profile} slope={n.slopeAbove}]";
+        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} off={n.offsetV:F3}/{n.offsetH:F3} tilt={n.tiltV:F1}/{n.tiltH:F1} fil={n.filletTop:F2}/{n.filletBottom:F2} prof={n.profile} slope={n.slopeAbove}]";
         private string DumpAll() => string.Join(" ", nodes.ConvertAll(Dump).ToArray()) + $" | len={length:F3} hS={hScale:F3} vS={vScale:F3}";
 
         private static T ParseEnum<T>(string s, T fallback) where T : struct =>
@@ -970,6 +1059,7 @@ namespace ProceduralParts
                     pm.vScale = vScale;
                     pm.airfoil = airfoil;
                     pm.shellMode = shellMode;
+                    pm.shellThickness = shellThickness;
                     pm.selectedNode = selectedNode;
                     pm.nodes.Clear();
                     foreach (SpineNode n in nodes) pm.nodes.Add(n.Clone());
@@ -997,12 +1087,13 @@ namespace ProceduralParts
         private readonly List<GameObject> _profIcons = new List<GameObject>();     // section glyph (above)
         private readonly List<GameObject> _leftTips = new List<GameObject>();      // left mesh-edge handle
         private readonly List<GameObject> _rightTips = new List<GameObject>();     // right mesh-edge handle
-        private int _dragIndex = -1;     // node being vertically dragged
+        private int _dragIndex = -1;     // node being centre-offset dragged
+        private int _dragAxis;           // 0 = vertical (left-drag), 1 = horizontal (right-drag)
         private int _tipDragIndex = -1;  // node whose tip is being dragged
         private int _tipSide;            // -1 = left tip, +1 = right tip
         // Offset between the grabbed value and the cursor at mouse-down, so a drag moves the value by the
         // cursor delta instead of snapping it to wherever the (possibly off-centre) grab landed.
-        private float _grabDeltaV, _grabDeltaW, _grabDeltaP;
+        private float _grabDeltaV, _grabDeltaH, _grabDeltaW, _grabDeltaP;
         private bool _inputLocked;
         private const ControlTypes GizmoLockMask = ControlTypes.EDITOR_PAD_PICK_PLACE | ControlTypes.CAMERACONTROLS;
         private string GizmoLockId => "SpineGizmo_" + GetInstanceID();
@@ -1043,8 +1134,8 @@ namespace ProceduralParts
                 bool showTips = isSel || !showActiveOnly;
 
                 float y = (nodes[i].position - 0.5f) * length;
-                float rH = Erh(nodes[i]), off = Eoff(nodes[i]);
-                Vector3 baseW = part.transform.TransformPoint(new Vector3(0f, y, off));   // node centre (incl. offset)
+                float rH = Erh(nodes[i]), off = Eoff(nodes[i]), offX = EoffH(nodes[i]);
+                Vector3 baseW = part.transform.TransformPoint(new Vector3(offX, y, off));   // node centre (incl. offsets)
 
                 bool nodeHot = (i == hover && hoverKind == HoverKind.Node);
                 float s = (isSel || nodeHot) ? 0.30f : 0.22f;
@@ -1060,8 +1151,8 @@ namespace ProceduralParts
                 PlaceIcon(_profIcons[i], baseW + up * 0.32f, rot, profHot ? 0.22f : 0.16f,
                           ProfileIconMesh(nodes[i].profile), profHot ? HandleMat(2) : ProfileMat, true, cam);
 
-                Vector3 lW = part.transform.TransformPoint(new Vector3(-rH, y, off));
-                Vector3 rW = part.transform.TransformPoint(new Vector3(rH, y, off));
+                Vector3 lW = part.transform.TransformPoint(new Vector3(-rH + offX, y, off));
+                Vector3 rW = part.transform.TransformPoint(new Vector3(rH + offX, y, off));
                 bool lHot = (i == hover && hoverKind == HoverKind.TipLeft);
                 bool rHot = (i == hover && hoverKind == HoverKind.TipRight);
                 PlaceTip(_leftTips[i], lW, rot, showTips, lHot, cam);
@@ -1143,7 +1234,7 @@ namespace ProceduralParts
             Plane plane = new Plane(part.transform.forward, center);   // local-Z normal -> the X/Y plane
             if (!plane.Raycast(ray, out float enter)) return false;
             Vector3 local = part.transform.InverseTransformPoint(ray.GetPoint(enter));
-            rawW = 2f * Mathf.Abs(local.x) / Mathf.Max(0.01f, hScale);
+            rawW = 2f * Mathf.Abs(local.x - EoffH(n)) / Mathf.Max(0.01f, hScale);   // width about the (possibly offset) centre
             rawP = local.y / Mathf.Max(0.01f, length) + 0.5f;
             return true;
         }
@@ -1178,16 +1269,21 @@ namespace ProceduralParts
         {
             if (_dragIndex >= 0)
             {
-                if (Input.GetMouseButton(0))
+                int btn = (_dragAxis == 1) ? 1 : 0;   // left-drag = vertical, right-drag = horizontal
+                if (Input.GetMouseButton(btn))
                 {
                     SetInputLock(true);
-                    DragNodeVertical(_dragIndex, cam.ScreenPointToRay(Input.mousePosition));
+                    Ray ray = cam.ScreenPointToRay(Input.mousePosition);
+                    if (_dragAxis == 1) DragNodeHorizontal(_dragIndex, ray);
+                    else DragNodeVertical(_dragIndex, ray);
                 }
                 else
                 {
                     _dragIndex = -1;
                     RebuildAndPropagate();   // one full interop + symmetry sync on release
-                    nodeOffsetV = nodes[SelIndex].offsetV;
+                    if (_dragAxis == 1) nodeOffsetH = nodes[SelIndex].offsetH;
+                    else nodeOffsetV = nodes[SelIndex].offsetV;
+                    _dragAxis = 0;
                     MonoUtilities.RefreshPartContextWindow(part);
                 }
                 return;
@@ -1241,7 +1337,8 @@ namespace ProceduralParts
                 default:
                     // Node circle. With "must select before dragging" on, the first click only selects
                     // (so you can click a node without moving it) and only the already-selected node
-                    // drags; with it off, any node drags immediately. Drag = vertical offset, wheel = height.
+                    // drags; with it off, any node drags immediately. Left-drag = vertical offset,
+                    // right-drag = horizontal offset, wheel = height.
                     if (Input.GetMouseButtonDown(0))
                     {
                         bool canDrag = !requireSelectToDrag || hover == SelIndex;
@@ -1249,7 +1346,19 @@ namespace ProceduralParts
                         if (canDrag)
                         {
                             _dragIndex = hover;
+                            _dragAxis = 0;
                             _grabDeltaV = nodes[hover].offsetV - RawVertical(hover, cam.ScreenPointToRay(Input.mousePosition));
+                        }
+                    }
+                    else if (Input.GetMouseButtonDown(1))
+                    {
+                        bool canDrag = !requireSelectToDrag || hover == SelIndex;
+                        SelectNode(hover);
+                        if (canDrag)
+                        {
+                            _dragIndex = hover;
+                            _dragAxis = 1;
+                            _grabDeltaH = nodes[hover].offsetH - RawHorizontal(hover, cam.ScreenPointToRay(Input.mousePosition));
                         }
                     }
                     else if (!Mathf.Approximately(Input.mouseScrollDelta.y, 0f)) ResizeNode(hover, Input.mouseScrollDelta.y);
@@ -1356,6 +1465,26 @@ namespace ProceduralParts
             if (Mathf.Approximately(newOffset, n.offsetV)) return;   // no change -> skip rebuild
             n.offsetV = newOffset;
             if (i == SelIndex) nodeOffsetV = newOffset;   // PAW value updates; refresh on drag end
+            RebuildLive();   // full sync deferred to drag end
+        }
+
+        // Cursor-projected horizontal offset (m, pre-hScale) from a drag ray along the part's local X axis.
+        private float RawHorizontal(int i, Ray ray)
+        {
+            Vector3 axisPoint = part.transform.TransformPoint(new Vector3(0f, NodeY(nodes[i]), 0f));   // un-offset centre
+            float xWorld = ClosestParamOnAxis(axisPoint, part.transform.right, ray);                   // metres along local X
+            return (hScale > 0f) ? xWorld / hScale : xWorld;
+        }
+
+        // Right-dragging a node moves its cross-section left/right (horizontal centre offset), tracking
+        // the mouse along the part's local horizontal (X) axis.
+        private void DragNodeHorizontal(int i, Ray ray)
+        {
+            SpineNode n = nodes[i];
+            float newOffset = Mathf.Clamp(RawHorizontal(i, ray) + _grabDeltaH, -10f, 10f);
+            if (Mathf.Approximately(newOffset, n.offsetH)) return;   // no change -> skip rebuild
+            n.offsetH = newOffset;
+            if (i == SelIndex) nodeOffsetH = newOffset;   // PAW value updates; refresh on drag end
             RebuildLive();   // full sync deferred to drag end
         }
 
@@ -1520,6 +1649,10 @@ namespace ProceduralParts
         {
             int rc = rings.Count;
 
+            // Shell: the inner wall is the outline inset by the shell thickness (not coincident), so the
+            // wall has real depth. Built once and reused for every ring's inner-skin vertex.
+            List<Ring> inner = shellMode ? BuildInnerRings(rings) : null;
+
             // Hard-edge columns: outline indices where the section turns sharply (Rectangle/Mk2
             // corners). Detected globally (union over rings) so the loft topology stays a clean
             // grid; a corner that rounds out along a profile morph keeps its column but the two
@@ -1572,7 +1705,7 @@ namespace ProceduralParts
                                   : (sd > 0) ? RingV(ring, j + 1) - RingV(ring, j)
                                              : RingV(ring, j + 1) - RingV(ring, j - 1);
                     Vector3 normal = Vector3.Cross(tSpine, tRing).normalized;
-                    Vector3 radial = new Vector3(pos.x, 0f, pos.z - ring.offsetZ);   // from the ring centre
+                    Vector3 radial = new Vector3(pos.x - ring.offsetX, 0f, pos.z - ring.offsetZ);   // from the ring centre
                     if (Vector3.Dot(normal, radial) < 0f) normal = -normal;
                     if (normal == Vector3.zero) normal = (radial.sqrMagnitude > 0f) ? radial.normalized : Vector3.right;
                     mesh.normals[idx] = normal;
@@ -1580,10 +1713,10 @@ namespace ProceduralParts
                     mesh.tangents[idx] = new Vector4(tan.x, tan.y, tan.z, 1f);
                     mesh.uv[idx] = new Vector2((k == K) ? 1f : arcFrac[j], vCoord);
 
-                    if (shellMode)   // inner skin: same point, flipped normal
+                    if (shellMode)   // inner skin: inset inward by the wall thickness, normal flipped
                     {
                         int iidx = innerBase + idx;
-                        mesh.vertices[iidx] = pos;
+                        mesh.vertices[iidx] = RingV(inner[r], j);
                         mesh.normals[iidx] = -normal;
                         mesh.tangents[iidx] = new Vector4(-tan.x, -tan.y, -tan.z, 1f);
                         mesh.uv[iidx] = mesh.uv[idx];
@@ -1655,9 +1788,12 @@ namespace ProceduralParts
 
         private void GenerateCapMesh(List<Ring> rings)
         {
-            if (shellMode)   // open ends -> no caps
+            if (shellMode)   // open ends: close the wall edge with a thin rim so it doesn't look paper-thin
             {
-                WriteToAppropriateMesh(new UncheckedMesh(0, 0), PPart.EndsIconMesh, EndsMesh);
+                var rim = new UncheckedMesh(4 * Sides, 8 * Sides);
+                WriteRim(rim, rings[0], 0, 0, false);                              // bottom rim
+                WriteRim(rim, rings[rings.Count - 1], 2 * Sides, 4 * Sides, true); // top rim
+                WriteToAppropriateMesh(rim, PPart.EndsIconMesh, EndsMesh);
                 return;
             }
             var mesh = new UncheckedMesh(Sides * 2, (Sides - 2) * 2);
@@ -1666,6 +1802,33 @@ namespace ProceduralParts
             WriteCapTriangles(mesh, false, 0, 0);
             WriteCapTriangles(mesh, true, Sides, Sides - 2);
             WriteToAppropriateMesh(mesh, PPart.EndsIconMesh, EndsMesh);
+        }
+
+        // One open-end rim: a thin annulus from the outer outline to the inner (inset) outline, flat-shaded
+        // along the spine axis so the wall reads solid at the mouth. vOff/triOff index into the shared mesh.
+        // Emitted double-sided so it's visible from either side regardless of the winding convention.
+        private void WriteRim(UncheckedMesh mesh, Ring outer, int vOff, int triOff, bool up)
+        {
+            Ring inner = InnerRing(outer);
+            Vector3 nrm = new Vector3(0f, up ? 1f : -1f, 0f);
+            for (int j = 0; j < Sides; j++)
+            {
+                int oi = vOff + j, ii = vOff + Sides + j;
+                mesh.vertices[oi] = RingV(outer, j); mesh.normals[oi] = nrm; mesh.tangents[oi] = new Vector4(1f, 0f, 0f, 1f);
+                mesh.uv[oi] = new Vector2((float)j / Sides, 1f);
+                mesh.vertices[ii] = RingV(inner, j); mesh.normals[ii] = nrm; mesh.tangents[ii] = new Vector4(1f, 0f, 0f, 1f);
+                mesh.uv[ii] = new Vector2((float)j / Sides, 0f);
+            }
+            int t = triOff * 3;
+            for (int j = 0; j < Sides; j++)
+            {
+                int jn = (j + 1) % Sides;
+                int o = vOff + j, on = vOff + jn, ic = vOff + Sides + j, inn = vOff + Sides + jn;
+                mesh.triangles[t++] = o; mesh.triangles[t++] = on; mesh.triangles[t++] = inn;
+                mesh.triangles[t++] = o; mesh.triangles[t++] = inn; mesh.triangles[t++] = ic;
+                mesh.triangles[t++] = o; mesh.triangles[t++] = inn; mesh.triangles[t++] = on;
+                mesh.triangles[t++] = o; mesh.triangles[t++] = ic; mesh.triangles[t++] = inn;
+            }
         }
 
         private void WriteCapVertices(UncheckedMesh mesh, Ring ring, int offset, bool up)

@@ -85,6 +85,10 @@ namespace ProceduralParts
         [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Shell thickness", guiFormat = "F3", guiUnits = "m", groupName = ProceduralPart.PAWGroupName),
             UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0.005f, maxValue = 1.0f, incrementLarge = 0.1f, incrementSmall = 0.02f, incrementSlide = SliderPrecision, sigFigs = 3, unit = "m", useSI = true, affectSymCounterparts = UI_Scene.None)]
         public float shellThickness = 0.05f;
+        // Max fraction of a section's smaller half-extent the wall may inset (so the inner bore never
+        // crosses the centre). Shared by the geometry clamp (InnerRing) and the slider's upper bound.
+        private const float ShellInsetFraction = 0.49f;
+        private const float MinShellThickness = 0.005f;
 
         // Gizmo behaviour toggles (editor-only prefs). showActiveOnly limits the resize tips to the
         // selected node (selectors + section glyphs always show).
@@ -384,6 +388,7 @@ namespace ProceduralParts
             EnsureNodes();
             SortNodes();
             part.CoMOffset = CoMOffset;
+            if (HighLogic.LoadedSceneIsEditor && shellMode) UpdateShellThicknessRange();
 
             List<Ring> rings = BuildRings();
             float maxDia = 0f, minDia = float.MaxValue;
@@ -663,7 +668,7 @@ namespace ProceduralParts
         // clamped so a thick wall on a small section can't collapse or invert the hole.
         private Ring InnerRing(Ring outer)
         {
-            float t = Mathf.Min(shellThickness, 0.45f * Mathf.Min(outer.rH, outer.rV));
+            float t = Mathf.Min(shellThickness, ShellInsetFraction * Mathf.Min(outer.rH, outer.rV));
             Ring inner = outer;                       // struct copy carries y/offsets/tilt
             inner.outline = InsetOutline(outer.outline, t);
             return inner;
@@ -786,20 +791,6 @@ namespace ProceduralParts
         private static float WaistFactor(SpineSlope slope, float t) =>
             slope == SpineSlope.Waisted ? 1f - 0.35f * Mathf.Sin(Mathf.PI * t) : 1f;
 
-        // Lateral (skin) surface area: each segment's average perimeter times its length.
-        private static float LateralArea(List<Ring> rings)
-        {
-            float area = 0f;
-            float prevP = OutlinePerimeter(rings[0].outline);
-            for (int i = 1; i < rings.Count; i++)
-            {
-                float p = OutlinePerimeter(rings[i].outline);
-                area += 0.5f * (prevP + p) * Mathf.Abs(rings[i].y - rings[i - 1].y);
-                prevP = p;
-            }
-            return area;
-        }
-
         // Top-view planform area: trapezoidal integral of the full width (2*rH) along the spine.
         private static float PlanformArea(List<Ring> rings)
         {
@@ -839,24 +830,29 @@ namespace ProceduralParts
 
         public override float CalculateVolume() => CalculateVolume(BuildRings());
 
-        // Trapezoidal integration of the actual section area (shoelace of each ring's outline) along
-        // the spine -- correct for any profile (ellipse/rect/Mk2/Mk3). A shell only contains its thin
-        // wall material, so it reports the lateral skin area * a notional wall thickness instead. Both
-        // the Volume property and this override use this single definition so SeekVolume / volume bounds
-        // stay self-consistent in either mode. Subdivided rings keep it tight.
+        // Trapezoidal integration of the material cross-section area along the spine -- correct for any
+        // profile (ellipse/rect/Mk2/Mk3). Solid uses the full outline area; a shell uses only the wall,
+        // i.e. the outer section minus the inner (inset) section from the same InnerRing the mesh builds.
+        // That respects the thickness clamp and can't double-count once the wall is a big fraction of the
+        // radius (perimeter*thickness overcounts the corners there). Both the Volume property and this
+        // override use this single definition so SeekVolume / volume bounds stay self-consistent.
         private float CalculateVolume(List<Ring> rings)
         {
-            if (shellMode) return LateralArea(rings) * shellThickness;
             float v = 0f;
-            float prevArea = RingArea(rings[0]);
+            float prevArea = SectionArea(rings[0]);
             for (int i = 1; i < rings.Count; i++)
             {
-                float area = RingArea(rings[i]);
+                float area = SectionArea(rings[i]);
                 v += (rings[i].y - rings[i - 1].y) * 0.5f * (prevArea + area);
                 prevArea = area;
             }
             return Mathf.Abs(v);
         }
+
+        // Material cross-section of a ring: the full outline when solid, or the annulus (outer minus the
+        // clamped inner outline) in shell mode -- bounded by the outer area, so it never exceeds the solid.
+        private float SectionArea(Ring ring) =>
+            shellMode ? Mathf.Max(0f, RingArea(ring) - RingArea(InnerRing(ring))) : RingArea(ring);
 
         public override void AdjustDimensionBounds()
         {
@@ -949,6 +945,24 @@ namespace ProceduralParts
 
         // The shell-thickness slider only matters when the hollow shell is on.
         private void UpdateShellVisibility() => Fields[nameof(shellThickness)].guiActiveEditor = shellMode;
+
+        // Scale the shell-thickness slider's range to the part: the wall can inset at most
+        // ShellInsetFraction of the narrowest section's smaller half-extent, so cap the slider there
+        // (and scale its steps) so every value on the slider is actually achievable. Also heals a saved
+        // thickness that's now too big for a shrunken part.
+        private void UpdateShellThicknessRange()
+        {
+            if (!(Fields[nameof(shellThickness)].uiControlEditor is UI_FloatEdit e)) return;
+            float minHalf = float.MaxValue;
+            foreach (SpineNode n in nodes) minHalf = Mathf.Min(minHalf, Mathf.Min(Erh(n), Erv(n)));
+            if (minHalf == float.MaxValue || minHalf <= 0f) minHalf = 0.5f;
+            float max = Mathf.Max(2f * MinShellThickness, ShellInsetFraction * minHalf);
+            e.minValue = MinShellThickness;
+            e.maxValue = max;
+            e.incrementLarge = max * 0.25f;
+            e.incrementSmall = max * 0.05f;
+            shellThickness = Mathf.Clamp(shellThickness, MinShellThickness, max);
+        }
 
         // At each end of the spine only the inward insert makes sense: the top node (highest position /
         // last index) hides "in front", the bottom node (index 0) hides "behind". The end nodes are also

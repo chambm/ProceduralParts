@@ -20,6 +20,8 @@ namespace ProceduralParts
         private const string GRP = "IntakeScale";
         private static readonly string ModTag = "[ProceduralParts.ModuleIntakeScale]";
 
+        #region Config parameters
+
         [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Intake width", guiFormat = "F2", groupName = GRP, groupDisplayName = "Intake Scale"),
             UI_FloatEdit(scene = UI_Scene.Editor, minValue = 0.25f, maxValue = 6f, incrementLarge = 0.5f, incrementSmall = 0.1f, incrementSlide = 0.01f, sigFigs = 2)]
         public float scaleWidth = 1f;
@@ -38,6 +40,8 @@ namespace ProceduralParts
         [KSPField] public float massExponent = 3f;
         [KSPField] public float costExponent = 2.5f;
 
+        #endregion
+
         private Vector3 _baseModelScale = Vector3.one;
         private Vector3[] _baseNodePos;
         private float _baseMass, _baseCost, _baseAjeArea = -1f;
@@ -47,6 +51,8 @@ namespace ProceduralParts
 
         // width/height/length -> model-local axis indices (length from lengthAxis; the remaining two are w,h).
         private int _lenIdx, _wIdx, _hIdx;
+
+        #region Initialization
 
         public override void OnStart(StartState state)
         {
@@ -68,6 +74,10 @@ namespace ProceduralParts
             base.OnStartFinished(state);
             ApplyScale();   // after all modules started (AJEInlet, drag cubes) -> authoritative
         }
+
+        #endregion
+
+        #region Scaling
 
         private void ResolveAxes()
         {
@@ -102,8 +112,14 @@ namespace ProceduralParts
                 _baseNodePos[i] = (pn != null) ? pn.originalPosition : part.attachNodes[i].originalPosition;
             }
 
-            if (Intake is ModuleResourceIntake mri && _baseAjeArea < 0f)
-                _baseAjeArea = ReadAjeArea(mri);
+            if (_baseAjeArea < 0f)
+            {
+                // Read the base Area from the PREFAB's intake (like the other base captures above), not the
+                // live instance: a persisted / already-scaled Area on the instance would otherwise be taken
+                // as the base and compound on every save-reload.
+                ModuleResourceIntake pmri = (prefab != null) ? prefab.FindModuleImplementing<ModuleResourceIntake>() : Intake;
+                if (pmri != null) _baseAjeArea = ReadAjeArea(pmri);
+            }
         }
 
         private ModuleResourceIntake Intake => _intake != null ? _intake : (_intake = part.FindModuleImplementing<ModuleResourceIntake>());
@@ -141,7 +157,9 @@ namespace ProceduralParts
                 np[_wIdx] = bp[_wIdx] * scaleWidth;
                 np[_hIdx] = bp[_hIdx] * scaleHeight;
                 np[_lenIdx] = bp[_lenIdx] * scaleLength;
-                part.attachNodes[i].originalPosition = part.attachNodes[i].position = np;
+                // Only the live position; leave originalPosition at the design-time base (KSP uses it for
+                // symmetry / node reset). We re-apply from _baseNodePos on every rebuild, so it persists.
+                part.attachNodes[i].position = np;
             }
             if (part.srfAttachNode != null && _baseNodePos.Length == 0) { /* srf-only parts: nothing to move */ }
 
@@ -153,6 +171,8 @@ namespace ProceduralParts
             if (part.DragCubes != null)
                 part.DragCubes.ForceUpdate(true, true, true);
         }
+
+        #endregion
 
         #region AJE Area reflection (AJEInlet.Area)
 

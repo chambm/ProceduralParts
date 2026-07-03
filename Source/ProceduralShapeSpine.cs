@@ -28,6 +28,7 @@ namespace ProceduralParts
         [Persistent] public float tiltH = 0f;        // horizontal tilt (deg): +ve yaws the right of the ring forward (+spine)
         [Persistent] public float filletTop = 0f;    // top corner rounding, 0..1 of the half-min-extent
         [Persistent] public float filletBottom = 0f; // bottom corner rounding, 0..1
+        [Persistent] public float stretch = 0f;      // ellipse only: 0 = true ellipse, 1 = flat faces on the longer axis (toward a rectangle)
         [Persistent] public SpineProfile profile = SpineProfile.Ellipse;
         [Persistent] public SpineSlope slopeAbove = SpineSlope.Linear;
 
@@ -39,6 +40,7 @@ namespace ProceduralParts
         {
             position = position, sizeH = sizeH, sizeV = sizeV, offsetV = offsetV, offsetH = offsetH,
             tiltV = tiltV, tiltH = tiltH, filletTop = filletTop, filletBottom = filletBottom,
+            stretch = stretch,
             profile = profile, slopeAbove = slopeAbove,
         };
     }
@@ -161,6 +163,12 @@ namespace ProceduralParts
             UI_FloatRange(minValue = 0f, maxValue = 1f, stepIncrement = 0.05f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
         public float nodeFilletBottom = 0f;
 
+        // Ellipse: flatten the faces toward a rectangle (0 = true ellipse, 1 = flat wall). Applies to the
+        // longer axis's faces (they're congruent for a circle, so a single slider covers both). Ellipse only.
+        [KSPField(isPersistant = false, guiActiveEditor = true, guiName = "Stretch", guiFormat = "F2", groupName = ProceduralPart.PAWGroupName),
+            UI_FloatRange(minValue = 0f, maxValue = 1f, stepIncrement = 0.05f, scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public float nodeStretch = 0f;
+
         [KSPEvent(guiActiveEditor = true, guiName = "Add node in front", groupName = ProceduralPart.PAWGroupName)]
         public void AddNodeInFrontEvent() => AddNode(true);
 
@@ -224,6 +232,7 @@ namespace ProceduralParts
                     sb.Append('|').Append(n.position).Append(',').Append(n.sizeH).Append(',').Append(n.sizeV)
                       .Append(',').Append(n.offsetV).Append(',').Append(n.offsetH).Append(',').Append(n.tiltV).Append(',').Append(n.tiltH)
                       .Append(',').Append(n.filletTop).Append(',').Append(n.filletBottom)
+                      .Append(',').Append(n.stretch)
                       .Append(',').Append((int)n.profile).Append(',').Append((int)n.slopeAbove);
                 return sb.ToString();
             }
@@ -324,6 +333,7 @@ namespace ProceduralParts
                 Fields[nameof(nodeOffsetH)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeFilletTop)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeFilletBottom)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
+                Fields[nameof(nodeStretch)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(airfoil)].uiControlEditor.onFieldChanged = (f, o) => OnAirfoilChanged();
                 Fields[nameof(shellMode)].uiControlEditor.onFieldChanged = (f, o) => { UpdateShellVisibility(); RebuildAndPropagate(); };
                 Fields[nameof(shellThickness)].uiControlEditor.onFieldChanged = (f, o) => RebuildAndPropagate();
@@ -446,11 +456,12 @@ namespace ProceduralParts
         // Sides-point outline of a ring, morphing profile pa->pb by blend, scaled to rH x rV, with the
         // top/bottom fillet fractions also blended (a..b) for the rounded-rect profiles.
         private static Vector2[] RingOutline(SpineProfile pa, SpineProfile pb, float blend,
-                                             float rH, float rV, float ftA, float fbA, float ftB, float fbB)
+                                             float rH, float rV, float ftA, float fbA, float ftB, float fbB,
+                                             float sA, float sB)
         {
-            Vector2[] a = ProfileOutline(pa, rH, rV, ftA, fbA);
-            if (blend <= 0f || (pa == pb && ftA == ftB && fbA == fbB)) return a;
-            Vector2[] b = ProfileOutline(pb, rH, rV, ftB, fbB);
+            Vector2[] a = ProfileOutline(pa, rH, rV, ftA, fbA, sA);
+            if (blend <= 0f || (pa == pb && ftA == ftB && fbA == fbB && sA == sB)) return a;
+            Vector2[] b = ProfileOutline(pb, rH, rV, ftB, fbB, sB);
             var o = new Vector2[Sides];
             for (int j = 0; j < Sides; j++) o[j] = Vector2.Lerp(a[j], b[j], blend);
             return o;
@@ -460,20 +471,50 @@ namespace ProceduralParts
         // topology (its corners forced to vertices) so flats stay flat, corners stay crisp, and rings
         // of the same profile loft with aligned edges. Rectangle and Mk3 are rounded rectangles whose
         // corner radii come from the top/bottom fillet fractions (0 = sharp corner).
-        private static Vector2[] ProfileOutline(SpineProfile profile, float rH, float rV, float ftFrac, float fbFrac)
+        private static Vector2[] ProfileOutline(SpineProfile profile, float rH, float rV, float ftFrac, float fbFrac,
+                                                float stretch)
         {
             switch (profile)
             {
                 case SpineProfile.Rectangle: return BuildRoundedRect(rH, rV, ftFrac, fbFrac);
                 case SpineProfile.Mk3: return BuildMk3Outline(rH, rV);
+                case SpineProfile.Mk2: break;
+                default: // Ellipse: flatten toward a rectangle (superellipse) if the stretch slider is non-zero.
+                    if (stretch > 0f) return BuildStretchedEllipse(rH, rV, stretch);
+                    break;
             }
 
-            Vector2[] unit = (profile == SpineProfile.Mk2) ? UnitMk2 : UnitCircle;   // Mk2 / Ellipse
+            Vector2[] unit = (profile == SpineProfile.Mk2) ? UnitMk2 : UnitCircle;   // Mk2 / plain Ellipse
             Vector2 scale = new Vector2(rH, rV);
             var o = new Vector2[Sides];
             for (int j = 0; j < Sides; j++) o[j] = Vector2.Scale(unit[j], scale);
             return o;
         }
+
+        // Ellipse with the faces flattened toward a rectangle -- a superellipse sampled at the same uniform
+        // angles as UnitCircle (so it lofts/blends point-for-point with plain-ellipse and other-profile
+        // neighbours). Exponent e: 1 = true ellipse, ->0 flattens a face into a flat wall. The flattening is
+        // applied to the LONGER axis's end faces (left/right when wider, top/bottom when taller) -- for a
+        // circle the two are congruent, so one slider covers both; the shorter axis stays elliptical.
+        private static Vector2[] BuildStretchedEllipse(float rH, float rV, float stretch)
+        {
+            float e = SquarenessToExp(stretch);
+            bool wide = rH >= rV;
+            float eH = wide ? e : 1f;   // wide  -> flatten the left/right sides (x-faces)
+            float eV = wide ? 1f : e;   // tall  -> flatten the top/bottom (y-faces)
+            var o = new Vector2[Sides];
+            for (int j = 0; j < Sides; j++)
+            {
+                float a = 2f * Mathf.PI * j / Sides;
+                float c = Mathf.Cos(a), s = Mathf.Sin(a);
+                o[j] = new Vector2(Mathf.Sign(c) * Mathf.Pow(Mathf.Abs(c), eH) * rH,
+                                   Mathf.Sign(s) * Mathf.Pow(Mathf.Abs(s), eV) * rV);
+            }
+            return o;
+        }
+
+        // Map a 0..1 stretch slider to a superellipse exponent: 0 -> 1 (true ellipse), 1 -> near 0 (flat wall).
+        private static float SquarenessToExp(float sq) => Mathf.Lerp(1f, 0.08f, Mathf.Clamp01(sq));
 
         // Rounded rectangle: half-extents (rH, rV), independent top/bottom corner radii from the fillet
         // fractions (of the smaller half-extent). Tangent points are forced so the flats stay flat; the
@@ -726,7 +767,8 @@ namespace ProceduralParts
             {
                 y = NodeY(n), rH = rH, rV = rV, offsetZ = Eoff(n), offsetX = EoffH(n),
                 tanTiltV = TiltTan(n.tiltV), tanTiltH = TiltTan(n.tiltH),
-                outline = RingOutline(n.profile, n.profile, 0f, rH, rV, n.filletTop, n.filletBottom, n.filletTop, n.filletBottom),
+                outline = RingOutline(n.profile, n.profile, 0f, rH, rV, n.filletTop, n.filletBottom, n.filletTop, n.filletBottom,
+                                      n.stretch, n.stretch),
             };
         }
 
@@ -750,7 +792,11 @@ namespace ProceduralParts
                 // subdivision when both ends are rectangles (Mk2/Mk3/Ellipse ignore the fillet values).
                 bool filletMorph = lo.profile == SpineProfile.Rectangle && hi.profile == SpineProfile.Rectangle
                                    && (lo.filletTop != hi.filletTop || lo.filletBottom != hi.filletBottom);
-                bool morph = lo.profile != hi.profile || filletMorph;
+                // Likewise a stretch difference between two ellipses only bends the silhouette, so it also
+                // needs subdivision to morph smoothly.
+                bool stretchMorph = lo.profile == SpineProfile.Ellipse && hi.profile == SpineProfile.Ellipse
+                                    && lo.stretch != hi.stretch;
+                bool morph = lo.profile != hi.profile || filletMorph || stretchMorph;
                 int k = (slope == SpineSlope.Linear && !morph) ? 1 : 10;
                 for (int s = 1; s <= k; s++)
                 {
@@ -769,7 +815,8 @@ namespace ProceduralParts
                         tanTiltV = TiltTan(Mathf.Lerp(aTv, bTv, h)),
                         tanTiltH = TiltTan(Mathf.Lerp(aTh, bTh, h)),
                         outline = RingOutline(lo.profile, hi.profile, t, rH, rV,
-                                              lo.filletTop, lo.filletBottom, hi.filletTop, hi.filletBottom),
+                                              lo.filletTop, lo.filletBottom, hi.filletTop, hi.filletBottom,
+                                              lo.stretch, hi.stretch),
                     });
                 }
             }
@@ -903,6 +950,98 @@ namespace ProceduralParts
             coords.y *= Mathf.Max(0.01f, length);
         }
 
+        // --- Attachment following ---------------------------------------------------------------------
+        // The per-node PAW edits and gizmo drags change the surface but don't run through
+        // TranslateAttachmentsAndNodes (that only fires for the whole-part length / scale sliders). So we
+        // snapshot the attachments against the pre-edit geometry (SampleSurface + SnapshotAttachments),
+        // apply the edit, then re-place them on the post-edit geometry (ReplaceAttachments) so stack parts
+        // and surface-attached children stay glued to the skin as nodes are resized / offset / moved.
+
+        // Centre (offsetX/Z) + half-extents (rH/rV) of the body at a height y, sampled from the loft rings.
+        private struct SurfSlice { public float y, cX, cZ, sX, sZ; }
+
+        private List<SurfSlice> SampleSurface()
+        {
+            List<Ring> rings = BuildRings();   // sorted by y ascending
+            var s = new List<SurfSlice>(rings.Count);
+            foreach (Ring r in rings)
+                s.Add(new SurfSlice { y = r.y, cX = r.offsetX, cZ = r.offsetZ,
+                                      sX = Mathf.Max(1e-3f, r.rH), sZ = Mathf.Max(1e-3f, r.rV) });
+            return s;
+        }
+
+        // Interpolate the section centre / size at an arbitrary height y (clamped to the end rings).
+        private static SurfSlice SurfaceAt(List<SurfSlice> s, float y)
+        {
+            int n = s.Count;
+            if (n == 0) return new SurfSlice { y = y, sX = 1f, sZ = 1f };
+            if (y <= s[0].y) { SurfSlice r0 = s[0]; r0.y = y; return r0; }
+            if (y >= s[n - 1].y) { SurfSlice r1 = s[n - 1]; r1.y = y; return r1; }
+            for (int i = 1; i < n; i++)
+            {
+                if (y > s[i].y) continue;
+                SurfSlice a = s[i - 1], b = s[i];
+                float t = (y - a.y) / Mathf.Max(1e-3f, b.y - a.y);
+                return new SurfSlice { y = y, cX = Mathf.Lerp(a.cX, b.cX, t), cZ = Mathf.Lerp(a.cZ, b.cZ, t),
+                                       sX = Mathf.Lerp(a.sX, b.sX, t), sZ = Mathf.Lerp(a.sZ, b.sZ, t) };
+            }
+            SurfSlice last = s[n - 1]; last.y = y; return last;
+        }
+
+        // One attachment captured before an edit: `local` is the attach point in this part's frame (used
+        // to sample the surface), `world` its absolute position (used as the move origin, so a child still
+        // moves correctly even if a stack push has since shifted our own transform).
+        private struct AttachSnap { public AttachNode node; public bool stack; public Vector3 local, world; }
+
+        private List<AttachSnap> SnapshotAttachments()
+        {
+            var snaps = new List<AttachSnap>();
+            foreach (AttachNode n in part.attachNodes)
+                if (n.nodeType == AttachNode.NodeType.Stack)
+                    snaps.Add(new AttachSnap { node = n, stack = true, local = n.position });
+            foreach (Part c in part.children)
+                if (c.FindAttachNodeByPart(part) is AttachNode cn && cn.nodeType == AttachNode.NodeType.Surface)
+                {
+                    Vector3 world = cn.owner.transform.TransformPoint(cn.position);
+                    snaps.Add(new AttachSnap { node = cn, stack = false,
+                                               local = part.transform.InverseTransformPoint(world), world = world });
+                }
+            return snaps;
+        }
+
+        // Move each snapshotted attachment onto the current (post-edit) surface. A stack part sits on the
+        // axis, so its node follows only the section-centre offset; a surface child also scales radially
+        // with the per-axis size change (its offset from the section centre grows/shrinks with the skin).
+        private void ReplaceAttachments(List<SurfSlice> oldS, List<AttachSnap> snaps)
+        {
+            if (snaps == null || snaps.Count == 0) return;
+            List<SurfSlice> newS = SampleSurface();
+            foreach (AttachSnap s in snaps)
+            {
+                Vector3 p = s.local;
+                SurfSlice a = SurfaceAt(oldS, p.y), b = SurfaceAt(newS, p.y);
+                if (s.stack)
+                {
+                    Vector3 d = new Vector3(b.cX - a.cX, 0f, b.cZ - a.cZ);
+                    if (d.sqrMagnitude < 1e-8f) continue;
+                    TranslateNode(s.node, d);
+                    if (s.node.attachedPart is Part ap) TranslatePart(ap, d);
+                }
+                else
+                {
+                    Vector3 np = new Vector3(b.cX + (p.x - a.cX) * b.sX / a.sX, p.y,
+                                             b.cZ + (p.z - a.cZ) * b.sZ / a.sZ);
+                    if ((np - p).sqrMagnitude < 1e-8f) continue;
+                    Vector3 wNew = part.transform.TransformPoint(np);
+                    s.node.owner.transform.Translate(wNew - s.world, Space.World);
+                }
+            }
+        }
+
+        // Drag baseline: geometry + attachment snapshot captured at gizmo mouse-down, consumed on release.
+        private List<SurfSlice> _dragSurf0;
+        private List<AttachSnap> _dragAttach0;
+
         #endregion
 
         #region Node editing
@@ -930,17 +1069,21 @@ namespace ProceduralParts
             nodeOffsetH = n.offsetH;
             nodeFilletTop = n.filletTop;
             nodeFilletBottom = n.filletBottom;
+            nodeStretch = n.stretch;
             Fields[nameof(nodePos)].guiActiveEditor = !IsEndNode(SelIndex);   // end nodes are pinned fore/aft
-            UpdateFilletVisibility(n.profile);
+            UpdateProfileFieldVisibility(n.profile);
             UpdateAddButtons();
         }
 
-        // The fillet sliders only apply to the Rectangle profile (top/bottom corner rounding).
-        private void UpdateFilletVisibility(SpineProfile p)
+        // Profile-specific sliders: the fillets only apply to Rectangle (corner rounding), the stretch
+        // sliders only to Ellipse (face flattening).
+        private void UpdateProfileFieldVisibility(SpineProfile p)
         {
             bool rect = p == SpineProfile.Rectangle;
             Fields[nameof(nodeFilletTop)].guiActiveEditor = rect;
             Fields[nameof(nodeFilletBottom)].guiActiveEditor = rect;
+            bool ellipse = p == SpineProfile.Ellipse;
+            Fields[nameof(nodeStretch)].guiActiveEditor = ellipse;
         }
 
         // The shell-thickness slider only matters when the hollow shell is on.
@@ -998,6 +1141,9 @@ namespace ProceduralParts
             if (nodes.Count == 0) return;
             SpineNode n = nodes[SelIndex];
             Debug.Log($"{ModTag} OnNodeFieldChanged {f.name}: {obj} -> {f.GetValue(this)} | sel={SelIndex}/{nodes.Count} before: {Dump(n)}");
+            // Snapshot attachments against the pre-edit surface (before the switch mutates the node).
+            List<SurfSlice> oldSurf = SampleSurface();
+            List<AttachSnap> attachSnaps = SnapshotAttachments();
             try
             {
                 switch (f.name)
@@ -1011,9 +1157,10 @@ namespace ProceduralParts
                     case nameof(nodeOffsetH): n.offsetH = nodeOffsetH = Mathf.Clamp(nodeOffsetH, -10f, 10f); break;
                     case nameof(nodeFilletTop): n.filletTop = nodeFilletTop = Mathf.Clamp01(nodeFilletTop); break;
                     case nameof(nodeFilletBottom): n.filletBottom = nodeFilletBottom = Mathf.Clamp01(nodeFilletBottom); break;
+                    case nameof(nodeStretch): n.stretch = nodeStretch = Mathf.Clamp01(nodeStretch); break;
                     case nameof(nodeProfileOpt):
                         n.profile = ParseEnum(nodeProfileOpt, SpineProfile.Ellipse);
-                        UpdateFilletVisibility(n.profile);
+                        UpdateProfileFieldVisibility(n.profile);
                         MonoUtilities.RefreshPartContextWindow(part);
                         break;
                     case nameof(nodePos):
@@ -1033,6 +1180,7 @@ namespace ProceduralParts
                 SortNodes();
                 selectedNode = Mathf.Clamp(nodes.IndexOf(n), 0, nodes.Count - 1);
                 RebuildAndPropagate();
+                ReplaceAttachments(oldSurf, attachSnaps);   // keep attached parts on the new surface
                 Debug.Log($"{ModTag}  applied -> sel={SelIndex} after: {Dump(n)}");
             }
             catch (Exception e)
@@ -1041,7 +1189,7 @@ namespace ProceduralParts
             }
         }
 
-        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} off={n.offsetV:F3}/{n.offsetH:F3} tilt={n.tiltV:F1}/{n.tiltH:F1} fil={n.filletTop:F2}/{n.filletBottom:F2} prof={n.profile} slope={n.slopeAbove}]";
+        private static string Dump(SpineNode n) => $"[pos={n.position:F3} H={n.sizeH:F3} V={n.sizeV:F3} off={n.offsetV:F3}/{n.offsetH:F3} tilt={n.tiltV:F1}/{n.tiltH:F1} fil={n.filletTop:F2}/{n.filletBottom:F2} str={n.stretch:F2} prof={n.profile} slope={n.slopeAbove}]";
         private string DumpAll() => string.Join(" ", nodes.ConvertAll(Dump).ToArray()) + $" | len={length:F3} hS={hScale:F3} vS={vScale:F3}";
 
         private static T ParseEnum<T>(string s, T fallback) where T : struct =>
@@ -1295,6 +1443,8 @@ namespace ProceduralParts
                 {
                     _dragIndex = -1;
                     RebuildAndPropagate();   // one full interop + symmetry sync on release
+                    ReplaceAttachments(_dragSurf0, _dragAttach0);   // settle attached parts onto the new surface
+                    _dragSurf0 = null; _dragAttach0 = null;
                     if (_dragAxis == 1) nodeOffsetH = nodes[SelIndex].offsetH;
                     else nodeOffsetV = nodes[SelIndex].offsetV;
                     _dragAxis = 0;
@@ -1314,6 +1464,8 @@ namespace ProceduralParts
                 {
                     _tipDragIndex = -1;
                     RebuildAndPropagate();   // one full interop + symmetry sync on release
+                    ReplaceAttachments(_dragSurf0, _dragAttach0);   // settle attached parts onto the new surface
+                    _dragSurf0 = null; _dragAttach0 = null;
                     SpineNode sn = nodes[SelIndex];
                     nodeWidth = sn.sizeH;
                     nodePos = sn.position;
@@ -1340,6 +1492,7 @@ namespace ProceduralParts
                         SelectNode(hover);
                         _tipDragIndex = hover;
                         _tipSide = (hoverKind == HoverKind.TipLeft) ? -1 : 1;
+                        _dragSurf0 = SampleSurface(); _dragAttach0 = SnapshotAttachments();
                         // Capture the grab offset so the drag moves by the cursor delta, not snapping the
                         // value to the (possibly off-tip) grab point.
                         if (RawTip(hover, cam.ScreenPointToRay(Input.mousePosition), out float rw, out float rp))
@@ -1362,6 +1515,7 @@ namespace ProceduralParts
                             _dragIndex = hover;
                             _dragAxis = 0;
                             _grabDeltaV = nodes[hover].offsetV - RawVertical(hover, cam.ScreenPointToRay(Input.mousePosition));
+                            _dragSurf0 = SampleSurface(); _dragAttach0 = SnapshotAttachments();
                         }
                     }
                     else if (Input.GetMouseButtonDown(1))
@@ -1373,6 +1527,7 @@ namespace ProceduralParts
                             _dragIndex = hover;
                             _dragAxis = 1;
                             _grabDeltaH = nodes[hover].offsetH - RawHorizontal(hover, cam.ScreenPointToRay(Input.mousePosition));
+                            _dragSurf0 = SampleSurface(); _dragAttach0 = SnapshotAttachments();
                         }
                     }
                     else if (!Mathf.Approximately(Input.mouseScrollDelta.y, 0f)) ResizeNode(hover, Input.mouseScrollDelta.y);
@@ -1456,9 +1611,12 @@ namespace ProceduralParts
         private void ResizeNode(int i, float scroll)
         {
             SpineNode n = nodes[i];
+            List<SurfSlice> oldSurf = SampleSurface();
+            List<AttachSnap> snaps = SnapshotAttachments();
             float step = PPart.diameterSmallStep * Mathf.Sign(scroll);
             n.sizeV = Mathf.Clamp(n.sizeV + step, MinSize, MaxSize);
             RebuildAndPropagate();
+            ReplaceAttachments(oldSurf, snaps);
             if (i == SelIndex) { LoadProxyFromNode(); MonoUtilities.RefreshPartContextWindow(part); }
         }
 

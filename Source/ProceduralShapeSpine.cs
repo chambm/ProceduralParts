@@ -105,6 +105,10 @@ namespace ProceduralParts
         [KSPField] public string TopNodeName = "top";
         [KSPField] public string BottomNodeName = "bottom";
 
+        // Smallest bounding-circle diameter over the whole spine (set in UpdateShape). MaxDiameter is the
+        // largest; RP-1 tooling reads both to tool the spine as its min + max bounding cylinders.
+        public float MinBoundingDiameter { get; private set; }
+
         // Spine cross-sections, sorted by position. Serialized as SPINE_NODE subnodes.
         public readonly List<SpineNode> nodes = new List<SpineNode>();
 
@@ -401,14 +405,20 @@ namespace ProceduralParts
             if (HighLogic.LoadedSceneIsEditor && shellMode) UpdateShellThicknessRange();
 
             List<Ring> rings = BuildRings();
-            float maxDia = 0f, minDia = float.MaxValue;
+            float maxDia = 0f, minDia = float.MaxValue, minBoundDia = float.MaxValue;
             foreach (Ring r in rings)
             {
-                maxDia = Mathf.Max(maxDia, 2f * Mathf.Max(r.rH, r.rV));
+                float bound = 2f * Mathf.Max(r.rH, r.rV);   // bounding-circle diameter of this ring
+                maxDia = Mathf.Max(maxDia, bound);
+                minBoundDia = Mathf.Min(minBoundDia, bound);
                 minDia = Mathf.Min(minDia, 2f * Mathf.Min(r.rH, r.rV));
             }
             MaxDiameter = maxDia;
             MinDiameter = minDia;
+            // Smallest bounding-circle diameter over the spine (widest extent of the narrowest ring). Paired
+            // with MaxDiameter it gives RP-1 tooling the min/max bounding cylinders; equal for a constant
+            // section (even a non-circular one), so such a spine tools as a single cylinder, not two.
+            MinBoundingDiameter = (minBoundDia == float.MaxValue) ? maxDia : minBoundDia;
             InnerMaxDiameter = InnerMinDiameter = -1f;
             Length = length;
 

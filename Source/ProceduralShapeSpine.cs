@@ -14,6 +14,9 @@ namespace ProceduralParts
     // Silhouette of the segment ABOVE this node. Phase 1 implements Linear; the rest in Phase 2.
     public enum SpineSlope { Linear, Concave, Convex, Waisted }
 
+    // Which nodes show their edge (resize) tip handles. The node selectors themselves always show.
+    public enum SpineHandleVis { All, Active, None }
+
     // One cross-section along the spine. Persisted as a SPINE_NODE child node (see OnSave/OnLoad),
     // the same variable-length pattern ProceduralSRB uses for its bell configs.
     [Serializable]
@@ -92,11 +95,11 @@ namespace ProceduralParts
         private const float ShellInsetFraction = 0.49f;
         private const float MinShellThickness = 0.005f;
 
-        // Gizmo behaviour toggles (editor-only prefs). showActiveOnly limits the resize tips to the
-        // selected node (selectors + section glyphs always show).
-        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Show active node handles only", groupName = ProceduralPart.PAWGroupName),
-            UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
-        public bool showActiveOnly = true;
+        // Gizmo behaviour prefs (editor-only). handleVisOpt picks which nodes show their edge tips:
+        // All / Active (selected node only) / None. Node selectors + section glyphs always show.
+        [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Show Handles", groupName = ProceduralPart.PAWGroupName),
+            UI_ChooseOption(scene = UI_Scene.Editor, affectSymCounterparts = UI_Scene.None)]
+        public string handleVisOpt = nameof(SpineHandleVis.Active);
 
         [KSPField(isPersistant = true, guiActiveEditor = true, guiName = "Must select node before dragging", groupName = ProceduralPart.PAWGroupName),
             UI_Toggle(scene = UI_Scene.Editor, enabledText = "On", disabledText = "Off", affectSymCounterparts = UI_Scene.None)]
@@ -196,6 +199,7 @@ namespace ProceduralParts
             add.position = 0.5f * (cur.position + bound);
             nodes.Add(add);
             SortNodes();
+            ClampNodeSizes();   // a clone of a closed end lands inside the body, where zero isn't allowed
             selectedNode = nodes.IndexOf(add);
             RefreshSelector();
             LoadProxyFromNode();
@@ -213,6 +217,7 @@ namespace ProceduralParts
             }
             nodes.RemoveAt(SelIndex);
             selectedNode = Mathf.Clamp((int)selectedNode, 0, nodes.Count - 1);
+            ClampNodeSizes();   // dropping to two nodes can leave both ends closed -> reopen one
             RefreshSelector();
             LoadProxyFromNode();
             RebuildAndPropagate();
@@ -328,6 +333,8 @@ namespace ProceduralParts
                 UI_ChooseOption profOpt = Fields[nameof(nodeProfileOpt)].uiControlEditor as UI_ChooseOption;
                 profOpt.options = Enum.GetNames(typeof(SpineProfile));
                 profOpt.onFieldChanged = OnNodeFieldChanged;
+                UI_ChooseOption handleOpt = Fields[nameof(handleVisOpt)].uiControlEditor as UI_ChooseOption;
+                handleOpt.options = Enum.GetNames(typeof(SpineHandleVis));
                 Fields[nameof(nodeWidth)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeHeight)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
                 Fields[nameof(nodeTiltV)].uiControlEditor.onFieldChanged = OnNodeFieldChanged;
@@ -365,11 +372,11 @@ namespace ProceduralParts
             foreach (string fn in new[] { nameof(nodeWidth), nameof(nodeHeight) })
             {
                 UI_FloatEdit e = Fields[fn].uiControlEditor as UI_FloatEdit;
-                e.minValue = MinSize;
                 e.maxValue = MaxSize;
                 e.incrementLarge = PPart.diameterLargeStep;
                 e.incrementSmall = PPart.diameterSmallStep;
             }
+            UpdateSizeFieldBounds();
 
             ClampNodeSizes();   // heal any out-of-range sizes from older builds/crafts
             AdjustDimensionBounds();
@@ -752,19 +759,36 @@ namespace ProceduralParts
         private float MaxSize => (PPart.diameterMax == float.PositiveInfinity) ? 50f : Mathf.Min(PPart.diameterMax, 50f);
         private float MinSize => Mathf.Max(0.1f, PPart.diameterMin);
 
+        // A section with a zero half-extent has no area -- it has collapsed to a point (both axes) or a
+        // line (one axis), so it contributes no volume and nothing renders across it.
+        private static bool IsClosedSection(SpineNode n) => n.sizeH <= 0f || n.sizeV <= 0f;
+
+        // The two end nodes may shrink to zero so the loft closes to a point (a proper cone/ogive tip);
+        // interior nodes keep the normal minimum, since a pinched waist would just self-intersect.
+        // Exception: a two-node spine needs one open end -- closing both leaves a point-to-point line
+        // with nothing to loft, i.e. an invisible part. The second one is held at the normal minimum.
+        private float MinSizeFor(int i)
+        {
+            if (!IsEndNode(i)) return MinSize;
+            return (nodes.Count == 2 && IsClosedSection(nodes[1 - i])) ? MinSize : 0f;
+        }
+
         // Heal any out-of-range node sizes (e.g. a part bloated by an earlier bug) back into bounds.
         private void ClampNodeSizes()
         {
-            foreach (SpineNode n in nodes)
+            for (int i = 0; i < nodes.Count; i++)
             {
-                n.sizeH = Mathf.Clamp(n.sizeH, MinSize, MaxSize);
-                n.sizeV = Mathf.Clamp(n.sizeV, MinSize, MaxSize);
+                SpineNode n = nodes[i];
+                float min = MinSizeFor(i);
+                n.sizeH = Mathf.Clamp(n.sizeH, min, MaxSize);
+                n.sizeV = Mathf.Clamp(n.sizeV, min, MaxSize);
             }
         }
 
-        // Effective (scaled) half-extents of a node, clamped finite/positive.
-        private float Erh(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeH * hScale, 0.05f, 100f);
-        private float Erv(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeV * vScale, 0.05f, 100f);
+        // Effective (scaled) half-extents of a node, clamped finite/positive. The lower bound is 0 so a
+        // closed end collapses to a point; interior nodes are held at MinSize by the clamps above.
+        private float Erh(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeH * hScale, 0f, 100f);
+        private float Erv(SpineNode n) => 0.5f * Mathf.Clamp(n.sizeV * vScale, 0f, 100f);
         private float Eoff(SpineNode n) => Mathf.Clamp(n.offsetV * vScale, -100f, 100f);
         private float EoffH(SpineNode n) => Mathf.Clamp(n.offsetH * hScale, -100f, 100f);
         private static float TiltTan(float deg) => Mathf.Tan(Mathf.Deg2Rad * Mathf.Clamp(deg, -85f, 85f));
@@ -900,10 +924,30 @@ namespace ProceduralParts
             for (int i = 1; i < rings.Count; i++)
             {
                 float area = SectionArea(rings[i]);
-                v += (rings[i].y - rings[i - 1].y) * 0.5f * (prevArea + area);
+                // Simpson rather than trapezoid: the loft interpolates its vertices linearly between two
+                // rings, so the section area varies QUADRATICALLY along the segment (a product of two
+                // linear half-extents). The trapezoid rule over-reports every taper -- by 50% on a segment
+                // that closes to a point -- and a Linear segment isn't subdivided, so there's no ring
+                // density to hide it. Simpson is exact for a quadratic, so this matches the real mesh.
+                float midArea = SectionArea(MidRing(rings[i - 1], rings[i]));
+                v += (rings[i].y - rings[i - 1].y) * (prevArea + 4f * midArea + area) / 6f;
                 prevArea = area;
             }
             return Mathf.Abs(v);
+        }
+
+        // The section halfway between two rings. The mesh lerps its vertices, so the midpoint outline is
+        // the per-point average; only the outline and half-extents matter here (area, and the shell's
+        // inset clamp). Placement fields are irrelevant -- the outline is in local section coordinates.
+        private static Ring MidRing(Ring a, Ring b)
+        {
+            Ring m = a;
+            m.rH = 0.5f * (a.rH + b.rH);
+            m.rV = 0.5f * (a.rV + b.rV);
+            var o = new Vector2[a.outline.Length];
+            for (int j = 0; j < o.Length; j++) o[j] = 0.5f * (a.outline[j] + b.outline[j]);
+            m.outline = o;
+            return m;
         }
 
         // Material cross-section of a ring: the full outline when solid, or the annulus (outer minus the
@@ -1081,8 +1125,18 @@ namespace ProceduralParts
             nodeFilletBottom = n.filletBottom;
             nodeStretch = n.stretch;
             Fields[nameof(nodePos)].guiActiveEditor = !IsEndNode(SelIndex);   // end nodes are pinned fore/aft
+            UpdateSizeFieldBounds();
             UpdateProfileFieldVisibility(n.profile);
             UpdateAddButtons();
+        }
+
+        // The width/height sliders bottom out at 0 on an end node (closed tip) and at MinSize elsewhere,
+        // so the lower bound is re-applied whenever the selection changes.
+        private void UpdateSizeFieldBounds()
+        {
+            float min = MinSizeFor(SelIndex);
+            foreach (string fn in new[] { nameof(nodeWidth), nameof(nodeHeight) })
+                if (Fields[fn].uiControlEditor is UI_FloatEdit e) e.minValue = min;
         }
 
         // Profile-specific sliders: the fillets only apply to Rectangle (corner rounding), the stretch
@@ -1107,7 +1161,12 @@ namespace ProceduralParts
         {
             if (!(Fields[nameof(shellThickness)].uiControlEditor is UI_FloatEdit e)) return;
             float minHalf = float.MaxValue;
-            foreach (SpineNode n in nodes) minHalf = Mathf.Min(minHalf, Mathf.Min(Erh(n), Erv(n)));
+            foreach (SpineNode n in nodes)
+            {
+                // A closed end collapses to a point and has no wall to inset, so it constrains nothing.
+                float half = Mathf.Min(Erh(n), Erv(n));
+                if (half > 0f) minHalf = Mathf.Min(minHalf, half);
+            }
             if (minHalf == float.MaxValue || minHalf <= 0f) minHalf = 0.5f;
             float max = Mathf.Max(2f * MinShellThickness, ShellInsetFraction * minHalf);
             e.minValue = MinShellThickness;
@@ -1159,8 +1218,8 @@ namespace ProceduralParts
                 switch (f.name)
                 {
                     case nameof(nodeSlopeOpt): n.slopeAbove = ParseEnum(nodeSlopeOpt, SpineSlope.Linear); break;
-                    case nameof(nodeWidth): n.sizeH = nodeWidth = Mathf.Clamp(nodeWidth, MinSize, MaxSize); break;
-                    case nameof(nodeHeight): n.sizeV = nodeHeight = Mathf.Clamp(nodeHeight, MinSize, MaxSize); break;
+                    case nameof(nodeWidth): n.sizeH = nodeWidth = Mathf.Clamp(nodeWidth, MinSizeFor(SelIndex), MaxSize); break;
+                    case nameof(nodeHeight): n.sizeV = nodeHeight = Mathf.Clamp(nodeHeight, MinSizeFor(SelIndex), MaxSize); break;
                     case nameof(nodeTiltV): n.tiltV = nodeTiltV = Mathf.Clamp(nodeTiltV, -60f, 60f); break;
                     case nameof(nodeTiltH): n.tiltH = nodeTiltH = Mathf.Clamp(nodeTiltH, -60f, 60f); break;
                     case nameof(nodeOffsetV): n.offsetV = nodeOffsetV = Mathf.Clamp(nodeOffsetV, -10f, 10f); break;
@@ -1297,13 +1356,16 @@ namespace ProceduralParts
 
             Quaternion rot = (cam != null) ? cam.transform.rotation : Quaternion.identity;
             Vector3 up = (cam != null) ? cam.transform.up : Vector3.up;
+            SpineHandleVis vis = ParseEnum(handleVisOpt, SpineHandleVis.Active);
 
             for (int i = 0; i < nodes.Count; i++)
             {
                 bool isSel = (i == sel);
-                // Node selectors (circles) and section glyphs always show; "active only" just limits the
-                // resize tips to the selected node.
-                bool showTips = isSel || !showActiveOnly;
+                // All = every node's edge tips, Active = the selected node's only, None = no tips and no
+                // centre marker either (it swamps a small section), leaving just the section glyph above
+                // the node -- which still selects the node on click and cycles the profile on middle-click.
+                bool showTips = (vis == SpineHandleVis.All) || (vis == SpineHandleVis.Active && isSel);
+                bool showNode = vis != SpineHandleVis.None;
 
                 float y = (nodes[i].position - 0.5f) * length;
                 float rH = Erh(nodes[i]), off = Eoff(nodes[i]), offX = EoffH(nodes[i]);
@@ -1317,7 +1379,8 @@ namespace ProceduralParts
                 bool isLast = (i == nodes.Count - 1);
                 Mesh nodeMesh = IsEndNode(i) ? (_meshTriangle ??= BuildTriangle()) : (_meshCircle ??= BuildCircle());
                 Quaternion nodeRot = IsEndNode(i) ? SpineBillboard(cam, rot, isLast) : rot;
-                PlaceIcon(_nodeHandles[i], baseW, nodeRot, s, nodeMesh, nodeMat, true, cam);
+                if (_nodeHandles[i] != null && _nodeHandles[i].activeSelf != showNode) _nodeHandles[i].SetActive(showNode);
+                if (showNode) PlaceIcon(_nodeHandles[i], baseW, nodeRot, s, nodeMesh, nodeMat, true, cam);
 
                 bool profHot = (i == hover && hoverKind == HoverKind.Profile);
                 PlaceIcon(_profIcons[i], baseW + up * 0.32f, rot, profHot ? 0.22f : 0.16f,
@@ -1418,7 +1481,7 @@ namespace ProceduralParts
             SpineNode n = nodes[i];
             if (!RawTip(i, ray, out float rawW, out float rawP)) return;
 
-            float newH = Mathf.Clamp(rawW + _grabDeltaW, MinSize, MaxSize);
+            float newH = Mathf.Clamp(rawW + _grabDeltaW, MinSizeFor(i), MaxSize);
             // End nodes are pinned fore/aft -> width only.
             float pos = n.position;
             if (!IsEndNode(i))
@@ -1624,7 +1687,7 @@ namespace ProceduralParts
             List<SurfSlice> oldSurf = SampleSurface();
             List<AttachSnap> snaps = SnapshotAttachments();
             float step = PPart.diameterSmallStep * Mathf.Sign(scroll);
-            n.sizeV = Mathf.Clamp(n.sizeV + step, MinSize, MaxSize);
+            n.sizeV = Mathf.Clamp(n.sizeV + step, MinSizeFor(i), MaxSize);
             RebuildAndPropagate();
             ReplaceAttachments(oldSurf, snaps);
             if (i == SelIndex) { LoadProxyFromNode(); MonoUtilities.RefreshPartContextWindow(part); }
@@ -1886,8 +1949,24 @@ namespace ProceduralParts
                     Vector3 tRing = (sd < 0) ? RingV(ring, j) - RingV(ring, j - 1)
                                   : (sd > 0) ? RingV(ring, j + 1) - RingV(ring, j)
                                              : RingV(ring, j + 1) - RingV(ring, j - 1);
-                    Vector3 normal = Vector3.Cross(tSpine, tRing).normalized;
                     Vector3 radial = new Vector3(pos.x - ring.offsetX, 0f, pos.z - ring.offsetZ);   // from the ring centre
+                    // A zero-size end node collapses its ring to a point, leaving no ring tangent or radial
+                    // to build a normal from. Borrow both from the neighbouring ring so the tip shades like
+                    // the cone it closes instead of snapping to a fixed axis.
+                    if (tRing.sqrMagnitude < 1e-12f || radial.sqrMagnitude < 1e-12f)
+                    {
+                        Ring nbr = (r == 0) ? above : below;
+                        if (tRing.sqrMagnitude < 1e-12f)
+                            tRing = (sd < 0) ? RingV(nbr, j) - RingV(nbr, j - 1)
+                                  : (sd > 0) ? RingV(nbr, j + 1) - RingV(nbr, j)
+                                             : RingV(nbr, j + 1) - RingV(nbr, j - 1);
+                        if (radial.sqrMagnitude < 1e-12f)
+                        {
+                            Vector3 np = RingV(nbr, j);
+                            radial = new Vector3(np.x - nbr.offsetX, 0f, np.z - nbr.offsetZ);
+                        }
+                    }
+                    Vector3 normal = Vector3.Cross(tSpine, tRing).normalized;
                     if (Vector3.Dot(normal, radial) < 0f) normal = -normal;
                     if (normal == Vector3.zero) normal = (radial.sqrMagnitude > 0f) ? radial.normalized : Vector3.right;
                     mesh.normals[idx] = normal;
